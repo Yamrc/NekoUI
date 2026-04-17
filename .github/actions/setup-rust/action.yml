@@ -1,0 +1,43 @@
+name: setup-rust
+description: Shared Rust CI environment setup for NekoUI workflows.
+
+inputs:
+  components:
+    description: Optional comma-separated Rust components to install.
+    required: false
+    default: ""
+  install-linux-ui-deps:
+    description: Whether to install Linux GUI development packages.
+    required: false
+    default: "false"
+
+runs:
+  using: composite
+  steps:
+    - name: step::install_linux_packages
+      if: runner.os == 'Linux' && inputs.install-linux-ui-deps == 'true'
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          libwayland-dev \
+          libxkbcommon-dev \
+          libx11-dev \
+          libx11-xcb-dev \
+          libxcb1-dev \
+          libxcb-render0-dev \
+          libxcb-shape0-dev \
+          libxcb-xfixes0-dev
+
+    - name: step::install_rust_with_components
+      if: inputs.components != ''
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        components: ${{ inputs.components }}
+
+    - name: step::install_rust
+      if: inputs.components == ''
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: step::restore_cargo_cache
+      uses: Swatinem/rust-cache@v2

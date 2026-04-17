@@ -1,0 +1,55 @@
+[workspace]
+resolver = "2"
+members = ["crates/nekoui"]
+default-members = ["crates/nekoui"]
+
+[workspace.package]
+publish = false
+version = "0.0.1"
+edition = "2024"
+authors = ["Yamrc <yamrci@outlook.com>"]
+license = "MPL-2.0"
+
+[workspace.dependencies]
+accesskit = { version = "0.24.0", default-features = false }
+accesskit_winit = { version = "0.32.2", default-features = false, features = ["rwh_06", "accesskit_unix", "async-io"] }
+bitflags = { version = "2.6.0", default-features = false }
+bytemuck = { version = "1.25.0", default-features = false, features = ["derive"] }
+crossbeam-channel = { version = "0.5.15", default-features = false, features = ["std"] }
+cosmic-text = { version = "0.18.2", default-features = false, features = ["std", "swash"] }
+etagere = "0.2.15"
+hashbrown = { version = "0.15.2", default-features = false, features = ["default-hasher", "inline-more"] }
+log = "0.4.29"
+parking_lot = "0.12.5"
+pollster = { version = "0.4.0" }
+ropey = { version = "1.6.1", default-features = false, features = ["simd", "unicode_lines"] }
+rustc-hash = "2.1.1"
+slotmap = { version = "1.1.1", default-features = false, features = ["std"] }
+smallvec = { version = "1.15.1", features = ["union", "const_new"] }
+swash = "0.2.7"
+taffy = { version = "0.10.0", default-features = false, features = ["std", "taffy_tree", "flexbox", "block_layout", "content_size"] }
+thiserror = "2.0.18"
+unicode-segmentation = "1.12.0"
+wgpu = { version = "29.0.1", default-features = false, features = ["std", "parking_lot", "vulkan", "metal", "wgsl"] }
+winit = { version = "0.30.13", default-features = false, features = ["rwh_06", "x11", "wayland", "wayland-dlopen"] }
+
+[profile.dev]
+split-debuginfo = "unpacked"
+incremental = true
+codegen-units = 16
+
+[profile.dev.build-override]
+codegen-units = 16
+split-debuginfo = "unpacked"
+debug = true
+
+[profile.release]
+debug = "limited"
+lto = "thin"
+codegen-units = 1
+
+[profile.release-fast]
+inherits = "release"
+debug = "full"
+lto = false
+codegen-units = 16
