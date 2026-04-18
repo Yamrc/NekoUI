@@ -13,7 +13,9 @@ pub use app::{
     App, Application, BackgroundExecutor, Context, Entity, EventEmitter, LastWindowBehavior,
     Render, Subscription, Task, TaskResult, UiExecutor, View, WeakEntity,
 };
-pub use element::{Div, Element, ElementKind, IntoElement, ParentElement, Text, div, text};
+pub use element::{
+    AnyElement, Div, Fragment, IntoElement, IntoElements, ParentElement, Text, div, text,
+};
 pub use error::{Error, PlatformError, RuntimeError};
 pub use scene::DirtyLaneMask;
 pub use style::{

@@ -9,10 +9,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 
 use crossbeam_channel::{Receiver, Sender, bounded};
-use hashbrown::{HashMap, HashSet};
+use hashbrown::HashMap;
 use parking_lot::Mutex;
 
-use crate::element::{Element, ElementKind, IntoElement, ViewSpec};
+use crate::element::{AnyElement, BuildCx, BuildResult, IntoElement, SpecArena};
 use crate::error::{Error, RuntimeError};
 use crate::platform;
 use crate::scene::DirtyLaneMask;
@@ -56,9 +56,9 @@ impl Default for Application {
 }
 
 type WakeHandle = Arc<dyn Fn() + Send + Sync>;
-type WindowBuildFn = Box<dyn FnOnce(&mut Window, &mut App) -> Element + 'static>;
+type WindowBuildFn = Box<dyn FnOnce(&mut Window, &mut App) -> AnyElement + 'static>;
 type ViewRenderer =
-    fn(u64, &Rc<RefCell<RuntimeState>>, &mut Window) -> Result<Element, RuntimeError>;
+    fn(u64, &Rc<RefCell<RuntimeState>>, &mut Window) -> Result<AnyElement, RuntimeError>;
 type ObserveCallback = Box<dyn FnMut(&Rc<RefCell<RuntimeState>>, u64) -> Result<(), RuntimeError>>;
 type EventCallback =
     Box<dyn FnMut(&Rc<RefCell<RuntimeState>>, u64, &dyn Any) -> Result<(), RuntimeError>>;
@@ -154,13 +154,13 @@ impl App {
         build_root: impl FnOnce(&mut Window, &mut App) -> E + 'static,
     ) -> Result<WindowHandle, Error>
     where
-        E: IntoElement<Element = Element>,
+        E: IntoElement,
     {
         let id = WindowId::new();
         self.pending_windows.push_back(PendingWindowRequest {
             id,
             options,
-            build_root: Box::new(move |window, app| build_root(window, app).into_element()),
+            build_root: Box::new(move |window, app| build_root(window, app).into_any_element()),
         });
         self.wake_runtime();
         Ok(WindowHandle::new(id))
@@ -273,16 +273,6 @@ impl App {
         Ok(result)
     }
 
-    pub(crate) fn resolve_root_element_with_views(
-        &self,
-        window: &mut Window,
-        template: &Element,
-    ) -> Result<(Element, HashSet<u64>), RuntimeError> {
-        let mut referenced_views = HashSet::new();
-        let resolved = self.resolve_element(window, template, &mut referenced_views)?;
-        Ok((resolved, referenced_views))
-    }
-
     pub(crate) fn make_runtime_window(
         id: WindowId,
         options: &WindowOptions,
@@ -299,36 +289,24 @@ impl App {
         )
     }
 
-    fn resolve_element(
+    pub(crate) fn build_root_spec(
         &self,
         window: &mut Window,
-        template: &Element,
-        referenced_views: &mut HashSet<u64>,
-    ) -> Result<Element, RuntimeError> {
-        match template.kind() {
-            ElementKind::Div(div) => {
-                let mut resolved = div.clone();
-                resolved.children = div
-                    .children
-                    .iter()
-                    .map(|child| self.resolve_element(window, child, referenced_views))
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok(resolved.into_element())
-            }
-            ElementKind::Text(text) => Ok(text.clone().into_element()),
-            ElementKind::View(ViewSpec { entity_id }) => {
-                referenced_views.insert(*entity_id);
-                let renderer = self
-                    .runtime
-                    .borrow()
-                    .view_renderers
-                    .get(entity_id)
-                    .copied()
-                    .ok_or(RuntimeError::EntityNotFound(*entity_id))?;
-                let rendered = renderer(*entity_id, &self.runtime, window)?;
-                self.resolve_element(window, &rendered, referenced_views)
-            }
-        }
+        template: &AnyElement,
+        arena: &mut SpecArena,
+    ) -> Result<BuildResult, RuntimeError> {
+        let runtime = self.runtime.clone();
+        let mut resolver = move |entity_id: u64, window: &mut Window| {
+            let renderer = runtime
+                .borrow()
+                .view_renderers
+                .get(&entity_id)
+                .copied()
+                .ok_or(RuntimeError::EntityNotFound(entity_id))?;
+            renderer(entity_id, &runtime, window)
+        };
+
+        BuildCx::new(window, &mut resolver, arena).build_root(template.clone())
     }
 
     fn take_dirty_batch(&self) -> Vec<(u64, DirtyLaneMask)> {
@@ -487,14 +465,6 @@ impl<T> View<T> {
             id: self.id,
             marker: PhantomData,
         }
-    }
-}
-
-impl<T> IntoElement for View<T> {
-    type Element = Element;
-
-    fn into_element(self) -> Self::Element {
-        Element::new(ElementKind::View(ViewSpec { entity_id: self.id }))
     }
 }
 
@@ -738,11 +708,7 @@ impl Drop for Subscription {
 }
 
 pub trait Render: 'static + Sized {
-    fn render(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<'_, Self>,
-    ) -> impl IntoElement<Element = Element>;
+    fn render(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement;
 }
 
 pub enum TaskResult<T> {
@@ -919,7 +885,7 @@ fn render_view_entity<T>(
     entity_id: u64,
     runtime: &Rc<RefCell<RuntimeState>>,
     window: &mut Window,
-) -> Result<Element, RuntimeError>
+) -> Result<AnyElement, RuntimeError>
 where
     T: Render + 'static,
 {
@@ -943,7 +909,7 @@ where
             runtime.borrow().background_executor.clone(),
             runtime.borrow().ui_executor.clone(),
         );
-        typed.render(window, &mut cx).into_element()
+        typed.render(window, &mut cx).into_any_element()
     };
 
     runtime
@@ -962,10 +928,16 @@ fn merge_lane(map: &mut HashMap<u64, DirtyLaneMask>, entity_id: u64, lane: Dirty
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
     use super::{
         App, Application, Entity, EventEmitter, LastWindowBehavior, TaskResult, UiExecutor,
     };
+    use crate::element::SpecArena;
+    use crate::element::{IntoElement, ParentElement};
     use crate::window::WindowOptions;
+    use crate::window::{Window, WindowId, WindowSize};
 
     #[derive(Default)]
     struct Counter {
@@ -1095,5 +1067,105 @@ mod tests {
         assert!(task.try_recv().is_none());
         executor.run_pending();
         matches!(task.recv(), TaskResult::Ready(42));
+    }
+
+    #[test]
+    fn cached_resolution_rerenders_only_dirty_nested_view() {
+        struct ChildView {
+            renders: Rc<RefCell<usize>>,
+        }
+
+        impl super::Render for ChildView {
+            fn render(
+                &mut self,
+                _window: &mut Window,
+                _cx: &mut super::Context<'_, Self>,
+            ) -> impl IntoElement {
+                *self.renders.borrow_mut() += 1;
+                crate::text("child")
+            }
+        }
+
+        struct ParentView {
+            renders: Rc<RefCell<usize>>,
+            child: super::View<ChildView>,
+        }
+
+        impl super::Render for ParentView {
+            fn render(
+                &mut self,
+                _window: &mut Window,
+                _cx: &mut super::Context<'_, Self>,
+            ) -> impl IntoElement {
+                *self.renders.borrow_mut() += 1;
+                crate::div().child(self.child)
+            }
+        }
+
+        let app = App::new();
+        let parent_renders = Rc::new(RefCell::new(0));
+        let child_renders = Rc::new(RefCell::new(0));
+        let child = app.insert_view(ChildView {
+            renders: child_renders.clone(),
+        });
+        let parent = app.insert_view(ParentView {
+            renders: parent_renders.clone(),
+            child,
+        });
+        let root = crate::div().child(parent).into_any_element();
+        let mut window = Window::new_with_metrics(
+            WindowId::new(),
+            String::from("test"),
+            WindowSize::new(320, 200),
+            WindowSize::new(320, 200),
+            1.0,
+        );
+        let mut arena = SpecArena::new();
+        let built = app.build_root_spec(&mut window, &root, &mut arena).unwrap();
+        assert_eq!(*parent_renders.borrow(), 1);
+        assert_eq!(*child_renders.borrow(), 1);
+        assert!(built.referenced_views.contains(&parent.id()));
+        assert!(built.referenced_views.contains(&child.id()));
+
+        let rebuilt = app.build_root_spec(&mut window, &root, &mut arena).unwrap();
+        assert_eq!(*parent_renders.borrow(), 2);
+        assert_eq!(*child_renders.borrow(), 2);
+        assert!(rebuilt.referenced_views.contains(&parent.id()));
+        assert!(rebuilt.referenced_views.contains(&child.id()));
+    }
+
+    #[test]
+    fn spec_arena_is_reused_between_builds() {
+        let app = App::new();
+        let mut window = Window::new_with_metrics(
+            WindowId::new(),
+            String::from("test"),
+            WindowSize::new(320, 200),
+            WindowSize::new(320, 200),
+            1.0,
+        );
+        let root = crate::div().child(crate::text("a")).into_any_element();
+        let mut arena = SpecArena::new();
+
+        let built = app.build_root_spec(&mut window, &root, &mut arena).unwrap();
+        let first_len = arena.len();
+        assert_eq!(first_len, 2);
+        assert!(matches!(
+            arena.node(built.root).kind,
+            crate::element::SpecKind::Div
+        ));
+
+        let root = crate::div()
+            .child(crate::text("a"))
+            .child(crate::text("b"))
+            .into_any_element();
+        let rebuilt = app.build_root_spec(&mut window, &root, &mut arena).unwrap();
+        let second_len = arena.len();
+
+        assert_eq!(second_len, 3);
+        assert!(matches!(
+            arena.node(rebuilt.root).kind,
+            crate::element::SpecKind::Div
+        ));
     }
 }

@@ -1,3 +1,6 @@
+use std::ops::Range;
+use std::sync::Arc;
+
 use crate::style::Color;
 use crate::text_system::TextLayout;
 
@@ -20,10 +23,117 @@ impl Default for LayoutBox {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SceneNodeId(pub u32);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct PrimitiveRange {
+    pub start: u32,
+    pub end: u32,
+}
+
+#[expect(
+    dead_code,
+    reason = "Phase 1 scene metadata API is ahead of full renderer usage"
+)]
+impl PrimitiveRange {
+    pub const fn new(start: u32, end: u32) -> Self {
+        Self { start, end }
+    }
+
+    pub fn len(self) -> usize {
+        (self.end - self.start) as usize
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.start == self.end
+    }
+
+    pub fn as_range(self) -> Range<usize> {
+        self.start as usize..self.end as usize
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct Transform2D {
+    pub tx: f32,
+    pub ty: f32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct ClipInfo {
+    pub bounds: Option<LayoutBox>,
+}
+
+pub type EffectMask = u32;
+
+#[derive(Debug, Clone)]
+pub struct SceneNode {
+    pub parent: Option<SceneNodeId>,
+    pub first_child: Option<SceneNodeId>,
+    pub next_sibling: Option<SceneNodeId>,
+    pub transform: Transform2D,
+    pub clip: ClipInfo,
+    pub opacity: f32,
+    pub effect_mask: EffectMask,
+    pub primitive_range: PrimitiveRange,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MaterialClass {
+    Quad,
+    Text,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum ClipClass {
+    #[default]
+    None,
+    Rect,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum EffectClass {
+    #[default]
+    None,
+    Opacity,
+}
+
+#[derive(Debug, Clone)]
+pub struct LogicalBatch {
+    pub primitive_range: PrimitiveRange,
+    pub material_class: MaterialClass,
+    pub clip_class: ClipClass,
+    pub effect_class: EffectClass,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum EffectRegionKind {
+    #[default]
+    None,
+}
+
+#[expect(
+    dead_code,
+    reason = "Effect region metadata is reserved for later scene/render integration"
+)]
+#[derive(Debug, Clone)]
+pub struct EffectRegion {
+    pub bounds: LayoutBox,
+    pub kind: EffectRegionKind,
+}
+
+#[expect(
+    dead_code,
+    reason = "Compiled scene carries forward-looking metadata for upcoming passes"
+)]
 #[derive(Debug, Clone)]
 pub struct CompiledScene {
     pub clear_color: Option<Color>,
-    pub primitives: Vec<Primitive>,
+    pub scene_nodes: Arc<[SceneNode]>,
+    pub primitives: Arc<[Primitive]>,
+    pub logical_batches: Arc<[LogicalBatch]>,
+    pub effect_regions: Arc<[EffectRegion]>,
 }
 
 #[derive(Debug, Clone)]
@@ -37,4 +147,13 @@ pub enum Primitive {
         layout: TextLayout,
         color: Color,
     },
+}
+
+impl Primitive {
+    pub fn material_class(&self) -> MaterialClass {
+        match self {
+            Primitive::Quad { .. } => MaterialClass::Quad,
+            Primitive::Text { .. } => MaterialClass::Text,
+        }
+    }
 }

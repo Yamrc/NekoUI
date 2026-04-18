@@ -1,36 +1,28 @@
 use std::sync::Arc;
 
-use hashbrown::{HashMap, HashSet};
+use hashbrown::HashMap;
 use winit::application::ApplicationHandler;
-use winit::dpi::{LogicalSize, PhysicalSize};
+use winit::dpi::LogicalSize;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
-use winit::window::{Window as WinitWindow, WindowAttributes, WindowId as WinitWindowId};
+use winit::window::{WindowAttributes, WindowId as WinitWindowId};
 
 use crate::app::{App, LastWindowBehavior};
 use crate::error::{Error, PlatformError};
-use crate::platform::wgpu::{RenderOutcome, RenderSystem, WindowRenderState};
-use crate::scene::RetainedTree;
+use crate::platform::wgpu::{RenderOutcome, RenderSystem};
 use crate::text_system::TextSystem;
-use crate::window::{Window, WindowSize};
+
+use super::window_runtime::{
+    RuntimeWindow, current_window_metrics, metrics_from_physical_size, metrics_from_scale_change,
+    window_depends_on_dirty_views,
+};
 
 #[derive(Debug, Clone, Copy)]
 enum RunnerEvent {
     Wake,
 }
 
-struct RuntimeWindow {
-    _internal_id: crate::WindowId,
-    public_window: Window,
-    native_window: Arc<WinitWindow>,
-    template_root: crate::Element,
-    referenced_views: HashSet<u64>,
-    retained_tree: RetainedTree,
-    compiled_scene: crate::scene::CompiledScene,
-    render_state: WindowRenderState,
-}
-
-struct Runner {
+struct AppRuntime {
     app: App,
     last_window_behavior: LastWindowBehavior,
     windows: HashMap<WinitWindowId, RuntimeWindow>,
@@ -38,14 +30,7 @@ struct Runner {
     render_system: Option<RenderSystem>,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct WindowMetrics {
-    logical_size: WindowSize,
-    physical_size: WindowSize,
-    scale_factor: f64,
-}
-
-impl Runner {
+impl AppRuntime {
     fn new(app: App, last_window_behavior: LastWindowBehavior) -> Self {
         Self {
             app,
@@ -83,17 +68,20 @@ impl Runner {
                 metrics.scale_factor,
             );
             let template_root = (request.build_root)(&mut public_window, &mut self.app);
-            let (resolved_root, referenced_views) = match self
-                .app
-                .resolve_root_element_with_views(&mut public_window, &template_root)
-            {
+            let mut build_scratch = crate::element::SpecArena::new();
+            let built = match self.app.build_root_spec(
+                &mut public_window,
+                &template_root,
+                &mut build_scratch,
+            ) {
                 Ok(value) => value,
                 Err(error) => {
                     log::error!("failed to resolve root element: {error}");
                     continue;
                 }
             };
-            let mut retained_tree = RetainedTree::from_element(&resolved_root);
+            let mut retained_tree =
+                crate::scene::RetainedTree::from_spec(&build_scratch, built.root);
 
             let render_state = if let Some(render_system) = self.render_system.as_mut() {
                 let surface = match render_system.create_surface_for_window(native_window.clone()) {
@@ -132,7 +120,8 @@ impl Runner {
                     public_window,
                     native_window: native_window.clone(),
                     template_root,
-                    referenced_views,
+                    referenced_views: built.referenced_views,
+                    build_scratch,
                     retained_tree,
                     compiled_scene,
                     render_state,
@@ -160,9 +149,10 @@ impl Runner {
                 continue;
             }
 
-            let (resolved_root, referenced_views) = match self.app.resolve_root_element_with_views(
+            let built = match self.app.build_root_spec(
                 &mut runtime_window.public_window,
                 &runtime_window.template_root,
+                &mut runtime_window.build_scratch,
             ) {
                 Ok(value) => value,
                 Err(error) => {
@@ -170,10 +160,10 @@ impl Runner {
                     continue;
                 }
             };
-            runtime_window.referenced_views = referenced_views;
+            runtime_window.referenced_views = built.referenced_views;
             let dirty = runtime_window
                 .retained_tree
-                .update_from_element(&resolved_root);
+                .update_from_spec(&runtime_window.build_scratch, built.root);
 
             if dirty.needs_layout() {
                 runtime_window
@@ -197,7 +187,7 @@ impl Runner {
     }
 }
 
-impl ApplicationHandler<RunnerEvent> for Runner {
+impl ApplicationHandler<RunnerEvent> for AppRuntime {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         self.process_window_requests(event_loop);
     }
@@ -313,56 +303,8 @@ pub(crate) fn run_application(
 
     on_launch(&mut app)?;
 
-    let mut runner = Runner::new(app, last_window_behavior);
+    let mut runtime = AppRuntime::new(app, last_window_behavior);
     event_loop
-        .run_app(&mut runner)
+        .run_app(&mut runtime)
         .map_err(|error| PlatformError::new(error.to_string()).into())
-}
-
-fn current_window_metrics(window: &WinitWindow) -> WindowMetrics {
-    metrics_from_parts(window.inner_size(), window.scale_factor())
-}
-
-fn metrics_from_physical_size(
-    runtime_window: &RuntimeWindow,
-    physical_size: PhysicalSize<u32>,
-) -> WindowMetrics {
-    metrics_from_parts(physical_size, runtime_window.native_window.scale_factor())
-}
-
-fn metrics_from_scale_change(runtime_window: &RuntimeWindow, scale_factor: f64) -> WindowMetrics {
-    metrics_from_parts(runtime_window.native_window.inner_size(), scale_factor)
-}
-
-fn metrics_from_parts(physical_size: PhysicalSize<u32>, scale_factor: f64) -> WindowMetrics {
-    let scale_factor = sanitize_scale_factor(scale_factor);
-    let logical_width = (f64::from(physical_size.width) / scale_factor)
-        .round()
-        .max(1.0) as u32;
-    let logical_height = (f64::from(physical_size.height) / scale_factor)
-        .round()
-        .max(1.0) as u32;
-
-    WindowMetrics {
-        logical_size: WindowSize::new(logical_width, logical_height),
-        physical_size: WindowSize::new(physical_size.width, physical_size.height),
-        scale_factor,
-    }
-}
-
-fn sanitize_scale_factor(scale_factor: f64) -> f64 {
-    if scale_factor.is_finite() && scale_factor > 0.0 {
-        scale_factor
-    } else {
-        1.0
-    }
-}
-
-fn window_depends_on_dirty_views(
-    runtime_window: &RuntimeWindow,
-    dirty_views: &HashMap<u64, crate::scene::DirtyLaneMask>,
-) -> bool {
-    dirty_views
-        .keys()
-        .any(|view_id| runtime_window.referenced_views.contains(view_id))
 }

@@ -1,4 +1,4 @@
-mod runner;
+mod runtime;
 pub(crate) mod wgpu;
 
-pub(crate) use runner::run_application;
+pub(crate) use runtime::run_application;

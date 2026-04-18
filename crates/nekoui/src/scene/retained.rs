@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use slotmap::{SlotMap, new_key_type};
 use smallvec::SmallVec;
 use taffy::prelude::{
@@ -8,12 +10,15 @@ use taffy::prelude::{
 use taffy::style::FlexDirection as TaffyFlexDirection;
 
 use crate::SharedString;
-use crate::element::{Div, Element, ElementKind, Text};
+use crate::element::{SpecArena, SpecKind, SpecNode, SpecNodeId, SpecPayload};
 use crate::style::{AlignItems, Direction, JustifyContent, Length, Style};
 use crate::text_system::{TextLayout, TextMeasureKey, TextSystem, measure_key};
 use crate::window::WindowSize;
 
-use super::{CompiledScene, DirtyLaneMask, LayoutBox, Primitive};
+use super::{
+    ClipClass, ClipInfo, CompiledScene, DirtyLaneMask, EffectClass, EffectMask, EffectRegion,
+    LayoutBox, LogicalBatch, Primitive, PrimitiveRange, SceneNode, SceneNodeId, Transform2D,
+};
 
 new_key_type! {
     pub struct NodeId;
@@ -35,6 +40,7 @@ pub struct RetainedNode {
     pub style: Style,
     pub layout: LayoutBox,
     pub dirty: DirtyLaneMask,
+    compiled_fragment: Option<Arc<CompiledSubtreeFragment>>,
     pub taffy_node: TaffyNodeId,
 }
 
@@ -68,38 +74,49 @@ struct TextMeasureContext {
 }
 
 impl TextMeasureContext {
-    fn new(text: &Text) -> Self {
+    fn from_spec(spec: &SpecNode) -> Self {
+        let text = match &spec.payload {
+            SpecPayload::Text(text) => text,
+            SpecPayload::None => unreachable!("text measure context requires text payload"),
+        };
         Self {
-            text: text.content.clone(),
-            style: text.style.text.clone(),
+            text: text.clone(),
+            style: spec.style.text.clone(),
             last_key: None,
             last_layout: None,
         }
     }
 }
 
+#[derive(Debug, Clone)]
+struct CompiledSubtreeFragment {
+    scene_nodes: Arc<[SceneNode]>,
+    primitives: Arc<[Primitive]>,
+    logical_batches: Arc<[LogicalBatch]>,
+}
+
 impl RetainedTree {
-    pub fn from_element(root: &Element) -> Self {
+    pub fn from_spec(arena: &SpecArena, root: SpecNodeId) -> Self {
         let mut tree = Self {
             root: NodeId::default(),
             nodes: SlotMap::with_key(),
             taffy: TaffyTree::new(),
         };
 
-        let root_id = tree.build_node(root, None);
+        let root_id = tree.build_node(arena, root, None);
         tree.root = root_id;
         tree
     }
 
-    pub fn update_from_element(&mut self, root: &Element) -> DirtyLaneMask {
+    pub fn update_from_spec(&mut self, arena: &SpecArena, root: SpecNodeId) -> DirtyLaneMask {
         self.clear_dirty_marks();
 
-        if !self.can_reuse_node(self.root, root) {
-            *self = RetainedTree::from_element(root);
+        if !self.can_reuse_node(self.root, arena.node(root)) {
+            *self = RetainedTree::from_spec(arena, root);
             return DirtyLaneMask::BUILD.normalized();
         }
 
-        self.diff_node(self.root, root).normalized()
+        self.diff_node(self.root, arena, root).normalized()
     }
 
     pub fn compute_layout(&mut self, size: WindowSize, text_system: &mut TextSystem) {
@@ -156,12 +173,16 @@ impl RetainedTree {
             let layout = *taffy
                 .layout(node.taffy_node)
                 .expect("layout must be available after compute_layout");
-            node.layout = LayoutBox {
+            let next_layout = LayoutBox {
                 x: layout.location.x,
                 y: layout.location.y,
                 width: layout.size.width,
                 height: layout.size.height,
             };
+            if node.layout != next_layout {
+                node.dirty |= DirtyLaneMask::LAYOUT;
+            }
+            node.layout = next_layout;
 
             if let NodeKind::Text {
                 layout: text_layout,
@@ -198,12 +219,14 @@ impl RetainedTree {
         &self.nodes[node_id].children
     }
 
-    pub fn compile_scene(&self) -> CompiledScene {
-        let mut primitives = Vec::with_capacity(self.nodes.len());
-        self.collect_primitives(self.root, 0.0, 0.0, &mut primitives);
+    pub fn compile_scene(&mut self) -> CompiledScene {
+        let root_fragment = self.get_or_build_subtree_fragment(self.root, false);
         CompiledScene {
             clear_color: None,
-            primitives,
+            scene_nodes: root_fragment.scene_nodes.clone(),
+            primitives: root_fragment.primitives.clone(),
+            logical_batches: root_fragment.logical_batches.clone(),
+            effect_regions: Arc::from(Vec::<EffectRegion>::new()),
         }
     }
 
@@ -213,39 +236,57 @@ impl RetainedTree {
         }
     }
 
-    fn diff_node(&mut self, node_id: NodeId, element: &Element) -> DirtyLaneMask {
-        match element.kind() {
-            ElementKind::Div(div) => self.diff_div(node_id, div),
-            ElementKind::Text(text) => self.diff_text(node_id, text),
-            ElementKind::View(_) => {
-                unreachable!("view nodes must be resolved before retained diff")
-            }
+    fn diff_node(
+        &mut self,
+        node_id: NodeId,
+        arena: &SpecArena,
+        spec_id: SpecNodeId,
+    ) -> DirtyLaneMask {
+        match arena.node(spec_id).kind {
+            SpecKind::Div => self.diff_div(node_id, arena, spec_id),
+            SpecKind::Text => self.diff_text(node_id, arena, spec_id),
         }
     }
 
-    fn diff_div(&mut self, node_id: NodeId, div: &Div) -> DirtyLaneMask {
-        let mut dirty = diff_div_style(&self.nodes[node_id].style, &div.style);
-        if self.nodes[node_id].style != div.style {
-            self.nodes[node_id].style = div.style.clone();
+    fn diff_div(
+        &mut self,
+        node_id: NodeId,
+        arena: &SpecArena,
+        spec_id: SpecNodeId,
+    ) -> DirtyLaneMask {
+        let spec = arena.node(spec_id);
+        let mut dirty = diff_div_style(&self.nodes[node_id].style, &spec.style);
+        if self.nodes[node_id].style != spec.style {
+            self.nodes[node_id].style = spec.style.clone();
             self.taffy
                 .set_style(
                     self.nodes[node_id].taffy_node,
-                    div_style_to_taffy(&div.style),
+                    div_style_to_taffy(&spec.style),
                 )
                 .expect("div style patch must succeed");
         }
-        self.nodes[node_id].key = div.key;
+        self.nodes[node_id].key = spec.key;
 
-        let child_dirty = self.sync_children(node_id, &div.children);
+        let child_dirty = self.sync_children(node_id, arena, arena.child_ids(spec_id).as_slice());
         dirty |= child_dirty;
         self.nodes[node_id].dirty |= dirty;
         dirty
     }
 
-    fn diff_text(&mut self, node_id: NodeId, text: &Text) -> DirtyLaneMask {
-        let mut dirty = diff_text_style(&self.nodes[node_id].style, &text.style);
+    fn diff_text(
+        &mut self,
+        node_id: NodeId,
+        arena: &SpecArena,
+        spec_id: SpecNodeId,
+    ) -> DirtyLaneMask {
+        let spec = arena.node(spec_id);
+        let text_content = match &spec.payload {
+            SpecPayload::Text(content) => content,
+            SpecPayload::None => unreachable!("text diff requires text payload"),
+        };
+        let mut dirty = diff_text_style(&self.nodes[node_id].style, &spec.style);
         let content_changed = match &self.nodes[node_id].kind {
-            NodeKind::Text { content, .. } => content.as_ref() != text.content.as_ref(),
+            NodeKind::Text { content, .. } => content.as_ref() != text_content.as_ref(),
             NodeKind::Div => unreachable!("text diff called for non-text node"),
         };
 
@@ -253,29 +294,29 @@ impl RetainedTree {
             dirty |= DirtyLaneMask::LAYOUT | DirtyLaneMask::PAINT;
         }
 
-        if self.nodes[node_id].style != text.style {
-            self.nodes[node_id].style = text.style.clone();
+        if self.nodes[node_id].style != spec.style {
+            self.nodes[node_id].style = spec.style.clone();
             self.taffy
                 .set_style(
                     self.nodes[node_id].taffy_node,
-                    text_style_to_taffy(&text.style),
+                    text_style_to_taffy(&spec.style),
                 )
                 .expect("text style patch must succeed");
         }
 
         if let NodeKind::Text { content, layout } = &mut self.nodes[node_id].kind {
-            *content = text.content.clone();
+            *content = text_content.clone();
             if dirty.needs_layout() || dirty.contains(DirtyLaneMask::PAINT) {
                 *layout = None;
             }
         }
-        self.nodes[node_id].key = text.key;
+        self.nodes[node_id].key = spec.key;
 
         if !dirty.is_empty() {
             self.taffy
                 .set_node_context(
                     self.nodes[node_id].taffy_node,
-                    Some(MeasureContext::Text(TextMeasureContext::new(text))),
+                    Some(MeasureContext::Text(TextMeasureContext::from_spec(spec))),
                 )
                 .expect("text node context patch must succeed");
         }
@@ -284,9 +325,14 @@ impl RetainedTree {
         dirty
     }
 
-    fn sync_children(&mut self, parent_id: NodeId, new_children: &[Element]) -> DirtyLaneMask {
+    fn sync_children(
+        &mut self,
+        parent_id: NodeId,
+        arena: &SpecArena,
+        new_children: &[SpecNodeId],
+    ) -> DirtyLaneMask {
         let old_children = self.nodes[parent_id].children.clone();
-        let keyed_path = self.uses_keyed_path(&old_children, new_children);
+        let keyed_path = self.uses_keyed_path(arena, &old_children, new_children);
         let mut next_children = SmallVec::<[NodeId; 4]>::with_capacity(new_children.len());
         let mut dirty = DirtyLaneMask::empty();
         let mut rebuild_required = false;
@@ -302,26 +348,27 @@ impl RetainedTree {
             }
         }
 
-        for (index, element) in new_children.iter().enumerate() {
+        for (index, spec_id) in new_children.iter().copied().enumerate() {
+            let spec = arena.node(spec_id);
             let positional = old_children
                 .get(index)
                 .copied()
                 .filter(|child_id| !reused.contains(child_id));
             let reused_child = if keyed_path {
-                if let Some(key) = element_key(element) {
+                if let Some(key) = spec.key {
                     keyed_old
-                        .get(&(key, element_class(element)))
+                        .get(&(key, spec_class(spec)))
                         .copied()
                         .filter(|child_id| !reused.contains(child_id))
-                        .filter(|child_id| self.can_reuse_node(*child_id, element))
+                        .filter(|child_id| self.can_reuse_node(*child_id, spec))
                         .or_else(|| {
-                            positional.filter(|child_id| self.can_reuse_node(*child_id, element))
+                            positional.filter(|child_id| self.can_reuse_node(*child_id, spec))
                         })
                 } else {
-                    positional.filter(|child_id| self.can_reuse_node(*child_id, element))
+                    positional.filter(|child_id| self.can_reuse_node(*child_id, spec))
                 }
             } else {
-                positional.filter(|child_id| self.can_reuse_node(*child_id, element))
+                positional.filter(|child_id| self.can_reuse_node(*child_id, spec))
             };
 
             let child_id = match reused_child {
@@ -331,7 +378,7 @@ impl RetainedTree {
                         child_list_changed = true;
                         dirty |= DirtyLaneMask::LAYOUT;
                     }
-                    dirty |= self.diff_node(existing_child, element);
+                    dirty |= self.diff_node(existing_child, arena, spec_id);
                     self.nodes[existing_child].parent = Some(parent_id);
                     existing_child
                 }
@@ -339,7 +386,7 @@ impl RetainedTree {
                     child_list_changed = true;
                     rebuild_required = true;
                     dirty |= DirtyLaneMask::BUILD;
-                    self.build_node(element, Some(parent_id))
+                    self.build_node(arena, spec_id, Some(parent_id))
                 }
             };
 
@@ -373,31 +420,35 @@ impl RetainedTree {
         dirty
     }
 
-    fn can_reuse_node(&self, node_id: NodeId, element: &Element) -> bool {
+    fn can_reuse_node(&self, node_id: NodeId, spec: &SpecNode) -> bool {
         let node = &self.nodes[node_id];
-        let new_key = element_key(element);
         let same_kind = matches!(
-            (&node.kind, element.kind()),
-            (NodeKind::Div, ElementKind::Div(_)) | (NodeKind::Text { .. }, ElementKind::Text(_))
+            (&node.kind, spec.kind),
+            (NodeKind::Div, SpecKind::Div) | (NodeKind::Text { .. }, SpecKind::Text)
         );
         if !same_kind {
             return false;
         }
 
-        match (node.key, new_key) {
+        match (node.key, spec.key) {
             (Some(existing), Some(new)) => existing == new,
             (None, None) => true,
             _ => false,
         }
     }
 
-    fn uses_keyed_path(&self, old_children: &[NodeId], new_children: &[Element]) -> bool {
+    fn uses_keyed_path(
+        &self,
+        arena: &SpecArena,
+        old_children: &[NodeId],
+        new_children: &[SpecNodeId],
+    ) -> bool {
         old_children
             .iter()
             .any(|child_id| self.nodes[*child_id].key.is_some())
             || new_children
                 .iter()
-                .any(|element| element_key(element).is_some())
+                .any(|spec_id| arena.node(*spec_id).key.is_some())
     }
 
     fn node_class(&self, node_id: NodeId) -> NodeClass {
@@ -407,21 +458,29 @@ impl RetainedTree {
         }
     }
 
-    fn build_node(&mut self, element: &Element, parent: Option<NodeId>) -> NodeId {
-        match element.kind() {
-            ElementKind::Div(div) => self.build_div(div, parent),
-            ElementKind::Text(text) => self.build_text(text, parent),
-            ElementKind::View(_) => {
-                unreachable!("view nodes must be resolved before building the retained tree")
-            }
+    fn build_node(
+        &mut self,
+        arena: &SpecArena,
+        spec_id: SpecNodeId,
+        parent: Option<NodeId>,
+    ) -> NodeId {
+        match arena.node(spec_id).kind {
+            SpecKind::Div => self.build_div(arena, spec_id, parent),
+            SpecKind::Text => self.build_text(arena, spec_id, parent),
         }
     }
 
-    fn build_div(&mut self, div: &Div, parent: Option<NodeId>) -> NodeId {
-        let child_ids = div
-            .children
-            .iter()
-            .map(|child| self.build_node(child, None))
+    fn build_div(
+        &mut self,
+        arena: &SpecArena,
+        spec_id: SpecNodeId,
+        parent: Option<NodeId>,
+    ) -> NodeId {
+        let spec = arena.node(spec_id);
+        let child_ids = arena
+            .child_ids(spec_id)
+            .into_iter()
+            .map(|child| self.build_node(arena, child, None))
             .collect::<SmallVec<[NodeId; 4]>>();
         let child_taffy_nodes = child_ids
             .iter()
@@ -430,7 +489,7 @@ impl RetainedTree {
 
         let taffy_node = self
             .taffy
-            .new_with_children(div_style_to_taffy(&div.style), &child_taffy_nodes)
+            .new_with_children(div_style_to_taffy(&spec.style), &child_taffy_nodes)
             .expect("div node creation must succeed");
 
         let node_id = self.nodes.insert_with_key(|id| RetainedNode {
@@ -438,10 +497,11 @@ impl RetainedTree {
             parent,
             children: child_ids.clone(),
             kind: NodeKind::Div,
-            key: div.key,
-            style: div.style.clone(),
+            key: spec.key,
+            style: spec.style.clone(),
             layout: LayoutBox::default(),
             dirty: DirtyLaneMask::BUILD.normalized(),
+            compiled_fragment: None,
             taffy_node,
         });
 
@@ -452,12 +512,22 @@ impl RetainedTree {
         node_id
     }
 
-    fn build_text(&mut self, text: &Text, parent: Option<NodeId>) -> NodeId {
+    fn build_text(
+        &mut self,
+        arena: &SpecArena,
+        spec_id: SpecNodeId,
+        parent: Option<NodeId>,
+    ) -> NodeId {
+        let spec = arena.node(spec_id);
+        let text_content = match &spec.payload {
+            SpecPayload::Text(content) => content,
+            SpecPayload::None => unreachable!("text node creation requires text payload"),
+        };
         let taffy_node = self
             .taffy
             .new_leaf_with_context(
-                text_style_to_taffy(&text.style),
-                MeasureContext::Text(TextMeasureContext::new(text)),
+                text_style_to_taffy(&spec.style),
+                MeasureContext::Text(TextMeasureContext::from_spec(spec)),
             )
             .expect("text node creation must succeed");
 
@@ -466,13 +536,14 @@ impl RetainedTree {
             parent,
             children: SmallVec::new(),
             kind: NodeKind::Text {
-                content: text.content.clone(),
+                content: text_content.clone(),
                 layout: None,
             },
-            key: text.key,
-            style: text.style.clone(),
+            key: spec.key,
+            style: spec.style.clone(),
             layout: LayoutBox::default(),
             dirty: DirtyLaneMask::BUILD.normalized(),
+            compiled_fragment: None,
             taffy_node,
         })
     }
@@ -490,21 +561,134 @@ impl RetainedTree {
         self.nodes.remove(node_id);
     }
 
-    fn collect_primitives(
-        &self,
+    fn get_or_build_subtree_fragment(
+        &mut self,
         node_id: NodeId,
-        offset_x: f32,
-        offset_y: f32,
-        primitives: &mut Vec<Primitive>,
-    ) {
+        ancestor_layout_dirty: bool,
+    ) -> Arc<CompiledSubtreeFragment> {
+        let subtree_scene_dirty = self.subtree_has_scene_dirty(node_id);
+        let subtree_layout_dirty = ancestor_layout_dirty || self.subtree_has_layout_dirty(node_id);
+
+        if !subtree_scene_dirty && let Some(cached) = &self.nodes[node_id].compiled_fragment {
+            return cached.clone();
+        }
+
+        if !subtree_layout_dirty && let Some(cached) = self.nodes[node_id].compiled_fragment.clone()
+        {
+            let primitives = self.rebuild_subtree_primitives_only(node_id);
+            let compiled_fragment = Arc::new(CompiledSubtreeFragment {
+                scene_nodes: cached.scene_nodes.clone(),
+                primitives: Arc::from(primitives),
+                logical_batches: cached.logical_batches.clone(),
+            });
+            self.nodes[node_id].compiled_fragment = Some(compiled_fragment.clone());
+            if node_id == self.root {
+                self.clear_dirty_after_compile();
+            }
+            return compiled_fragment;
+        }
+
+        let compiled_fragment = Arc::new(self.rebuild_compiled_subtree_fragment(node_id));
+        self.nodes[node_id].compiled_fragment = Some(compiled_fragment.clone());
+        if node_id == self.root {
+            self.clear_dirty_after_compile();
+        }
+        compiled_fragment
+    }
+
+    fn rebuild_compiled_subtree_fragment(&mut self, node_id: NodeId) -> CompiledSubtreeFragment {
         let node = &self.nodes[node_id];
         debug_assert_eq!(node.id, node_id);
         let bounds = LayoutBox {
-            x: offset_x + node.layout.x,
-            y: offset_y + node.layout.y,
+            x: 0.0,
+            y: 0.0,
             width: node.layout.width,
             height: node.layout.height,
         };
+
+        let mut scene_nodes = Vec::with_capacity(node.children.len() + 1);
+        let mut primitives = Vec::with_capacity(node.children.len() + 1);
+        scene_nodes.push(SceneNode {
+            parent: None,
+            first_child: None,
+            next_sibling: None,
+            transform: Transform2D {
+                tx: node.layout.x,
+                ty: node.layout.y,
+            },
+            clip: ClipInfo {
+                bounds: node.style.paint.clip_children.then_some(LayoutBox {
+                    x: 0.0,
+                    y: 0.0,
+                    width: node.layout.width,
+                    height: node.layout.height,
+                }),
+            },
+            opacity: node.style.paint.opacity,
+            effect_mask: EffectMask::default(),
+            primitive_range: PrimitiveRange::default(),
+        });
+
+        match &node.kind {
+            NodeKind::Div => {
+                if let Some(background) = node.style.paint.background {
+                    primitives.push(Primitive::Quad {
+                        bounds,
+                        color: background,
+                    });
+                }
+            }
+            NodeKind::Text { layout, .. } => {
+                if let Some(layout) = layout.clone() {
+                    primitives.push(Primitive::Text {
+                        bounds,
+                        layout,
+                        color: node.style.text.color,
+                    });
+                }
+            }
+        }
+        scene_nodes[0].primitive_range = PrimitiveRange::new(0, primitives.len() as u32);
+
+        let child_ids = self.nodes[node_id].children.clone();
+        let mut first_child = None;
+        let mut previous_child: Option<SceneNodeId> = None;
+        for child_id in child_ids {
+            let child_fragment = self.get_or_build_subtree_fragment(child_id, true);
+            let child_root = append_subtree_fragment(
+                &child_fragment,
+                Some(SceneNodeId(0)),
+                &mut scene_nodes,
+                &mut primitives,
+            );
+            if first_child.is_none() {
+                first_child = Some(child_root);
+            }
+            if let Some(previous_child) = previous_child {
+                scene_nodes[previous_child.0 as usize].next_sibling = Some(child_root);
+            }
+            previous_child = Some(child_root);
+        }
+        scene_nodes[0].first_child = first_child;
+
+        let logical_batches = build_logical_batches(&scene_nodes, &primitives);
+        CompiledSubtreeFragment {
+            scene_nodes: Arc::from(scene_nodes),
+            primitives: Arc::from(primitives),
+            logical_batches: Arc::from(logical_batches),
+        }
+    }
+
+    fn rebuild_subtree_primitives_only(&mut self, node_id: NodeId) -> Vec<Primitive> {
+        let node = &self.nodes[node_id];
+        let bounds = LayoutBox {
+            x: 0.0,
+            y: 0.0,
+            width: node.layout.width,
+            height: node.layout.height,
+        };
+
+        let mut primitives = Vec::with_capacity(node.children.len() + 1);
 
         match &node.kind {
             NodeKind::Div => {
@@ -526,9 +710,61 @@ impl RetainedTree {
             }
         }
 
-        for child_id in &node.children {
-            self.collect_primitives(*child_id, bounds.x, bounds.y, primitives);
+        let child_ids = self.nodes[node_id].children.clone();
+        for child_id in child_ids {
+            if !self.subtree_has_scene_dirty(child_id)
+                && let Some(cached) = &self.nodes[child_id].compiled_fragment
+            {
+                primitives.extend(cached.primitives.iter().cloned());
+                continue;
+            }
+
+            if self.subtree_has_layout_dirty(child_id) {
+                primitives.extend(
+                    self.get_or_build_subtree_fragment(child_id, true)
+                        .primitives
+                        .iter()
+                        .cloned(),
+                );
+            } else {
+                primitives.extend(self.rebuild_subtree_primitives_only(child_id));
+            }
         }
+
+        primitives
+    }
+
+    fn clear_dirty_after_compile(&mut self) {
+        for (_, node) in &mut self.nodes {
+            node.dirty = DirtyLaneMask::empty();
+        }
+    }
+
+    fn subtree_has_scene_dirty(&self, node_id: NodeId) -> bool {
+        if self.nodes[node_id].dirty.needs_scene_compile() {
+            return true;
+        }
+
+        self.nodes[node_id]
+            .children
+            .iter()
+            .copied()
+            .any(|child_id| self.subtree_has_scene_dirty(child_id))
+    }
+
+    fn subtree_has_layout_dirty(&self, node_id: NodeId) -> bool {
+        if self.nodes[node_id]
+            .dirty
+            .intersects(DirtyLaneMask::BUILD | DirtyLaneMask::LAYOUT)
+        {
+            return true;
+        }
+
+        self.nodes[node_id]
+            .children
+            .iter()
+            .copied()
+            .any(|child_id| self.subtree_has_layout_dirty(child_id))
     }
 }
 
@@ -567,19 +803,10 @@ fn diff_text_style(old: &Style, new: &Style) -> DirtyLaneMask {
     dirty
 }
 
-fn element_key(element: &Element) -> Option<u64> {
-    match element.kind() {
-        ElementKind::Div(div) => div.key,
-        ElementKind::Text(text) => text.key,
-        ElementKind::View(_) => None,
-    }
-}
-
-fn element_class(element: &Element) -> NodeClass {
-    match element.kind() {
-        ElementKind::Div(_) => NodeClass::Div,
-        ElementKind::Text(_) => NodeClass::Text,
-        ElementKind::View(_) => unreachable!("view nodes must be resolved before retained diff"),
+fn spec_class(spec: &SpecNode) -> NodeClass {
+    match spec.kind {
+        SpecKind::Div => NodeClass::Div,
+        SpecKind::Text => NodeClass::Text,
     }
 }
 
@@ -663,15 +890,144 @@ fn edge_to_auto(value: f32) -> LengthPercentageAuto {
     LengthPercentageAuto::length(value)
 }
 
+fn build_logical_batches(scene_nodes: &[SceneNode], primitives: &[Primitive]) -> Vec<LogicalBatch> {
+    let mut batches: Vec<LogicalBatch> = Vec::new();
+    let batch_meta = primitive_batch_meta(scene_nodes, primitives.len());
+
+    for (index, primitive) in primitives.iter().enumerate() {
+        let material_class = primitive.material_class();
+        let (clip_class, effect_class) = batch_meta[index];
+        if let Some(last_batch) = batches.last_mut()
+            && last_batch.material_class == material_class
+            && last_batch.clip_class == clip_class
+            && last_batch.effect_class == effect_class
+            && last_batch.primitive_range.end == index as u32
+        {
+            last_batch.primitive_range.end += 1;
+            continue;
+        }
+
+        batches.push(LogicalBatch {
+            primitive_range: PrimitiveRange::new(index as u32, index as u32 + 1),
+            material_class,
+            clip_class,
+            effect_class,
+        });
+    }
+
+    batches
+}
+
+fn primitive_batch_meta(
+    scene_nodes: &[SceneNode],
+    primitive_count: usize,
+) -> Vec<(ClipClass, EffectClass)> {
+    let mut out = vec![(ClipClass::None, EffectClass::None); primitive_count];
+    if !scene_nodes.is_empty() {
+        assign_batch_meta(
+            scene_nodes,
+            SceneNodeId(0),
+            ClipClass::None,
+            EffectClass::None,
+            &mut out,
+        );
+    }
+    out
+}
+
+fn assign_batch_meta(
+    scene_nodes: &[SceneNode],
+    node_id: SceneNodeId,
+    parent_clip: ClipClass,
+    parent_effect: EffectClass,
+    out: &mut [(ClipClass, EffectClass)],
+) {
+    let node = &scene_nodes[node_id.0 as usize];
+    let clip_class = if node.clip.bounds.is_some() {
+        ClipClass::Rect
+    } else {
+        parent_clip
+    };
+    let effect_class = if (node.opacity - 1.0).abs() > f32::EPSILON {
+        EffectClass::Opacity
+    } else {
+        parent_effect
+    };
+
+    for primitive_index in node.primitive_range.as_range() {
+        out[primitive_index] = (clip_class, effect_class);
+    }
+
+    let mut child = node.first_child;
+    while let Some(child_id) = child {
+        assign_batch_meta(scene_nodes, child_id, clip_class, effect_class, out);
+        child = scene_nodes[child_id.0 as usize].next_sibling;
+    }
+}
+
+fn append_subtree_fragment(
+    fragment: &CompiledSubtreeFragment,
+    parent: Option<SceneNodeId>,
+    out_nodes: &mut Vec<SceneNode>,
+    out_primitives: &mut Vec<Primitive>,
+) -> SceneNodeId {
+    let node_offset = out_nodes.len() as u32;
+    let primitive_offset = out_primitives.len() as u32;
+
+    for (index, node) in fragment.scene_nodes.iter().enumerate() {
+        let local_scene_id = SceneNodeId(index as u32);
+        out_nodes.push(SceneNode {
+            parent: if local_scene_id.0 == 0 {
+                parent
+            } else {
+                node.parent.map(|id| SceneNodeId(id.0 + node_offset))
+            },
+            first_child: node.first_child.map(|id| SceneNodeId(id.0 + node_offset)),
+            next_sibling: node.next_sibling.map(|id| SceneNodeId(id.0 + node_offset)),
+            transform: node.transform,
+            clip: node.clip,
+            opacity: node.opacity,
+            effect_mask: node.effect_mask,
+            primitive_range: PrimitiveRange::new(
+                node.primitive_range.start + primitive_offset,
+                node.primitive_range.end + primitive_offset,
+            ),
+        });
+    }
+
+    out_primitives.extend(fragment.primitives.iter().cloned());
+    SceneNodeId(node_offset)
+}
+
 #[cfg(test)]
 mod tests {
     use crate::app::{App, Render};
-    use crate::element::{IntoElement, ParentElement};
+    use crate::element::{BuildCx, IntoElement, ParentElement, SpecArena};
     use crate::style::{Color, EdgeInsets, Length};
     use crate::text_system::TextSystem;
     use crate::window::{Window, WindowId, WindowSize};
 
-    use super::{DirtyLaneMask, NodeKind, RetainedTree};
+    use super::{ClipClass, DirtyLaneMask, EffectClass, NodeKind, RetainedTree};
+
+    fn build_static_tree(root: crate::AnyElement) -> RetainedTree {
+        let mut window = Window::new_with_metrics(
+            WindowId::new(),
+            String::from("test"),
+            WindowSize::new(320, 200),
+            WindowSize::new(320, 200),
+            1.0,
+        );
+        let mut resolver = |_view_id: u64,
+                            _window: &mut Window|
+         -> Result<crate::AnyElement, crate::RuntimeError> {
+            unreachable!("static test tree should not resolve nested views")
+        };
+        let mut arena = SpecArena::new();
+        let built = BuildCx::new(&mut window, &mut resolver, &mut arena)
+            .build_root(root)
+            .unwrap();
+        RetainedTree::from_spec(&arena, built.root)
+    }
 
     #[test]
     fn text_measurement_wraps_within_available_width() {
@@ -679,9 +1035,9 @@ mod tests {
             .width(Length::Px(200.0))
             .padding(EdgeInsets::all(10.0))
             .child(crate::text("hello neko ui hello neko ui hello neko ui").font_size(16.0))
-            .into_element();
+            .into_any_element();
 
-        let mut tree = RetainedTree::from_element(&root);
+        let mut tree = build_static_tree(root);
         let mut text_system = TextSystem::new();
         tree.compute_layout(WindowSize::new(200, 120), &mut text_system);
 
@@ -707,8 +1063,24 @@ mod tests {
         let root = crate::div().child(crate::text("hello").color(Color::rgb(0x111111)));
         let updated = crate::div().child(crate::text("hello").color(Color::rgb(0x222222)));
 
-        let mut tree = RetainedTree::from_element(&root.into_element());
-        let dirty = tree.update_from_element(&updated.into_element());
+        let mut tree = build_static_tree(root.into_any_element());
+        let mut window = Window::new_with_metrics(
+            WindowId::new(),
+            String::from("test"),
+            WindowSize::new(320, 200),
+            WindowSize::new(320, 200),
+            1.0,
+        );
+        let mut resolver = |_view_id: u64,
+                            _window: &mut Window|
+         -> Result<crate::AnyElement, crate::RuntimeError> {
+            unreachable!("static test tree should not resolve nested views")
+        };
+        let mut arena = SpecArena::new();
+        let built = BuildCx::new(&mut window, &mut resolver, &mut arena)
+            .build_root(updated.into_any_element())
+            .unwrap();
+        let dirty = tree.update_from_spec(&arena, built.root);
         assert_eq!(dirty, DirtyLaneMask::PAINT);
     }
 
@@ -717,8 +1089,24 @@ mod tests {
         let root = crate::div().width(Length::Px(100.0));
         let updated = crate::div().width(Length::Px(140.0));
 
-        let mut tree = RetainedTree::from_element(&root.into_element());
-        let dirty = tree.update_from_element(&updated.into_element());
+        let mut tree = build_static_tree(root.into_any_element());
+        let mut window = Window::new_with_metrics(
+            WindowId::new(),
+            String::from("test"),
+            WindowSize::new(320, 200),
+            WindowSize::new(320, 200),
+            1.0,
+        );
+        let mut resolver = |_view_id: u64,
+                            _window: &mut Window|
+         -> Result<crate::AnyElement, crate::RuntimeError> {
+            unreachable!("static test tree should not resolve nested views")
+        };
+        let mut arena = SpecArena::new();
+        let built = BuildCx::new(&mut window, &mut resolver, &mut arena)
+            .build_root(updated.into_any_element())
+            .unwrap();
+        let dirty = tree.update_from_spec(&arena, built.root);
         assert_eq!(dirty, DirtyLaneMask::LAYOUT);
     }
 
@@ -727,8 +1115,24 @@ mod tests {
         let root = crate::div().child(crate::text("a"));
         let updated = crate::div().child(crate::text("a")).child(crate::text("b"));
 
-        let mut tree = RetainedTree::from_element(&root.into_element());
-        let dirty = tree.update_from_element(&updated.into_element());
+        let mut tree = build_static_tree(root.into_any_element());
+        let mut window = Window::new_with_metrics(
+            WindowId::new(),
+            String::from("test"),
+            WindowSize::new(320, 200),
+            WindowSize::new(320, 200),
+            1.0,
+        );
+        let mut resolver = |_view_id: u64,
+                            _window: &mut Window|
+         -> Result<crate::AnyElement, crate::RuntimeError> {
+            unreachable!("static test tree should not resolve nested views")
+        };
+        let mut arena = SpecArena::new();
+        let built = BuildCx::new(&mut window, &mut resolver, &mut arena)
+            .build_root(updated.into_any_element())
+            .unwrap();
+        let dirty = tree.update_from_spec(&arena, built.root);
         assert_eq!(dirty, DirtyLaneMask::BUILD.normalized());
     }
 
@@ -741,14 +1145,145 @@ mod tests {
             .child(crate::text("b").key(2))
             .child(crate::text("a").key(1));
 
-        let mut tree = RetainedTree::from_element(&root.into_element());
+        let mut tree = build_static_tree(root.into_any_element());
         let first = tree.children(tree.root_id())[0];
         let second = tree.children(tree.root_id())[1];
 
-        let dirty = tree.update_from_element(&updated.into_element());
+        let mut window = Window::new_with_metrics(
+            WindowId::new(),
+            String::from("test"),
+            WindowSize::new(320, 200),
+            WindowSize::new(320, 200),
+            1.0,
+        );
+        let mut resolver = |_view_id: u64,
+                            _window: &mut Window|
+         -> Result<crate::AnyElement, crate::RuntimeError> {
+            unreachable!("static test tree should not resolve nested views")
+        };
+        let mut arena = SpecArena::new();
+        let built = BuildCx::new(&mut window, &mut resolver, &mut arena)
+            .build_root(updated.into_any_element())
+            .unwrap();
+        let dirty = tree.update_from_spec(&arena, built.root);
         assert!(!dirty.contains(DirtyLaneMask::BUILD));
         assert!(dirty.contains(DirtyLaneMask::LAYOUT));
         assert_eq!(tree.children(tree.root_id()), &[second, first]);
+    }
+
+    #[test]
+    fn compile_scene_emits_scene_nodes_and_logical_batches() {
+        let root = crate::div()
+            .background(Color::rgb(0x111111))
+            .child(crate::text("hello"))
+            .into_any_element();
+
+        let mut tree = build_static_tree(root);
+        let mut text_system = TextSystem::new();
+        tree.compute_layout(WindowSize::new(320, 200), &mut text_system);
+        let compiled = tree.compile_scene();
+
+        assert_eq!(compiled.scene_nodes.len(), 2);
+        assert!(!compiled.primitives.is_empty());
+        assert!(!compiled.logical_batches.is_empty());
+        assert_eq!(compiled.logical_batches[0].primitive_range.start, 0);
+        assert!(
+            compiled.logical_batches.last().unwrap().primitive_range.end as usize
+                <= compiled.primitives.len()
+        );
+    }
+
+    #[test]
+    fn compile_scene_carries_clip_and_opacity_metadata() {
+        let root = crate::div()
+            .clip()
+            .opacity(0.5)
+            .child(crate::text("hello").opacity(0.25))
+            .into_any_element();
+
+        let mut tree = build_static_tree(root);
+        let mut text_system = TextSystem::new();
+        tree.compute_layout(WindowSize::new(320, 200), &mut text_system);
+        let compiled = tree.compile_scene();
+
+        assert_eq!(compiled.scene_nodes[0].opacity, 0.5);
+        assert!(compiled.scene_nodes[0].clip.bounds.is_some());
+        assert_eq!(compiled.scene_nodes[1].opacity, 0.25);
+    }
+
+    #[test]
+    fn paint_only_update_preserves_logical_batch_structure() {
+        let root = crate::div()
+            .background(Color::rgb(0x111111))
+            .child(crate::text("hello").color(Color::rgb(0x222222)))
+            .into_any_element();
+        let updated = crate::div()
+            .background(Color::rgb(0x333333))
+            .child(crate::text("hello").color(Color::rgb(0x444444)))
+            .into_any_element();
+
+        let mut tree = build_static_tree(root);
+        let mut text_system = TextSystem::new();
+        tree.compute_layout(WindowSize::new(320, 200), &mut text_system);
+        let original = tree.compile_scene();
+
+        let mut window = Window::new_with_metrics(
+            WindowId::new(),
+            String::from("test"),
+            WindowSize::new(320, 200),
+            WindowSize::new(320, 200),
+            1.0,
+        );
+        let mut resolver = |_view_id: u64,
+                            _window: &mut Window|
+         -> Result<crate::AnyElement, crate::RuntimeError> {
+            unreachable!("static test tree should not resolve nested views")
+        };
+        let mut arena = SpecArena::new();
+        let built = BuildCx::new(&mut window, &mut resolver, &mut arena)
+            .build_root(updated)
+            .unwrap();
+        let dirty = tree.update_from_spec(&arena, built.root);
+        assert_eq!(dirty, DirtyLaneMask::PAINT);
+        let updated_scene = tree.compile_scene();
+
+        assert_eq!(original.scene_nodes.len(), updated_scene.scene_nodes.len());
+        assert_eq!(
+            original.logical_batches.len(),
+            updated_scene.logical_batches.len()
+        );
+        assert_eq!(
+            original.logical_batches[0].primitive_range,
+            updated_scene.logical_batches[0].primitive_range
+        );
+    }
+
+    #[test]
+    fn logical_batches_reflect_clip_and_opacity_classes() {
+        let root = crate::div()
+            .clip()
+            .opacity(0.5)
+            .background(Color::rgb(0x111111))
+            .child(crate::text("hello"))
+            .into_any_element();
+
+        let mut tree = build_static_tree(root);
+        let mut text_system = TextSystem::new();
+        tree.compute_layout(WindowSize::new(320, 200), &mut text_system);
+        let compiled = tree.compile_scene();
+
+        assert!(
+            compiled
+                .logical_batches
+                .iter()
+                .any(|batch| batch.clip_class == ClipClass::Rect)
+        );
+        assert!(
+            compiled
+                .logical_batches
+                .iter()
+                .any(|batch| batch.effect_class == EffectClass::Opacity)
+        );
     }
 
     #[test]
@@ -760,7 +1295,7 @@ mod tests {
                 &mut self,
                 _window: &mut Window,
                 _cx: &mut crate::Context<'_, Self>,
-            ) -> impl IntoElement<Element = crate::Element> {
+            ) -> impl IntoElement {
                 crate::text("resolved from view")
             }
         }
@@ -774,12 +1309,10 @@ mod tests {
             WindowSize::new(640, 400),
             2.0,
         );
-        let root = crate::div().child(view).into_element();
-
-        let (resolved, _) = app
-            .resolve_root_element_with_views(&mut window, &root)
-            .unwrap();
-        let mut tree = RetainedTree::from_element(&resolved);
+        let root = crate::div().child(view).into_any_element();
+        let mut arena = SpecArena::new();
+        let built = app.build_root_spec(&mut window, &root, &mut arena).unwrap();
+        let mut tree = RetainedTree::from_spec(&arena, built.root);
         let mut text_system = TextSystem::new();
         tree.compute_layout(window.size(), &mut text_system);
 

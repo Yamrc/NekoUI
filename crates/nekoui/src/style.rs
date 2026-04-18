@@ -126,9 +126,21 @@ impl Default for LayoutStyle {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PaintStyle {
     pub background: Option<Color>,
+    pub opacity: f32,
+    pub clip_children: bool,
+}
+
+impl Default for PaintStyle {
+    fn default() -> Self {
+        Self {
+            background: None,
+            opacity: 1.0,
+            clip_children: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]

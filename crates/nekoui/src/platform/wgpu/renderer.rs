@@ -18,7 +18,7 @@ use winit::window::Window as WinitWindow;
 use crate::error::PlatformError;
 use crate::platform::wgpu::atlas::{AtlasEntry, GlyphAtlas, GlyphAtlasKind};
 use crate::platform::wgpu::context::WgpuContext;
-use crate::scene::{CompiledScene, Primitive};
+use crate::scene::{CompiledScene, MaterialClass, Primitive, SceneNodeId};
 use crate::style::Color;
 use crate::text_system::TextSystem;
 use crate::window::WindowSize;
@@ -56,6 +56,13 @@ struct ColorTextInstance {
     rect: [f32; 4],
     uv_rect: [f32; 4],
     alpha: f32,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct PrimitiveSceneState {
+    offset: [f32; 2],
+    opacity: f32,
+    clip: Option<crate::scene::LayoutBox>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -390,71 +397,135 @@ impl RenderSystem {
         scale_factor: f32,
     ) {
         let scale_factor = scale_factor.max(f32::MIN_POSITIVE);
-        for primitive in &scene.primitives {
-            match primitive {
-                Primitive::Quad { bounds, color } => self.quad_instances.push(QuadInstance {
-                    rect: [
-                        bounds.x * scale_factor,
-                        bounds.y * scale_factor,
-                        bounds.width * scale_factor,
-                        bounds.height * scale_factor,
-                    ],
-                    color: [color.r, color.g, color.b, color.a],
-                }),
-                Primitive::Text {
-                    bounds,
-                    layout,
-                    color,
-                } => {
-                    for run in &layout.runs {
-                        for glyph in &run.glyphs {
-                            let physical = glyph.physical(
-                                (
-                                    bounds.x * scale_factor,
-                                    (bounds.y + run.baseline) * scale_factor,
-                                ),
-                                scale_factor,
-                            );
-                            let Some((atlas_kind, entry)) =
-                                self.ensure_glyph_entry(text_system, physical.cache_key)
-                            else {
+        let primitive_states = collect_primitive_states(scene);
+        for batch in scene.logical_batches.iter() {
+            match batch.material_class {
+                MaterialClass::Quad => {
+                    for (primitive_index, primitive) in scene.primitives
+                        [batch.primitive_range.as_range()]
+                    .iter()
+                    .enumerate()
+                    {
+                        let primitive_index =
+                            batch.primitive_range.start as usize + primitive_index;
+                        let state = primitive_states[primitive_index];
+                        if let Primitive::Quad { bounds, color } = primitive {
+                            let rect = crate::scene::LayoutBox {
+                                x: bounds.x + state.offset[0],
+                                y: bounds.y + state.offset[1],
+                                width: bounds.width,
+                                height: bounds.height,
+                            };
+                            let Some(clipped_rect) = clip_rect(rect, state.clip) else {
                                 continue;
                             };
-                            let rect = [
-                                (physical.x + entry.placement_left) as f32,
-                                (physical.y - entry.placement_top) as f32,
-                                entry.width as f32,
-                                entry.height as f32,
-                            ];
+                            self.quad_instances.push(QuadInstance {
+                                rect: [
+                                    clipped_rect.x * scale_factor,
+                                    clipped_rect.y * scale_factor,
+                                    clipped_rect.width * scale_factor,
+                                    clipped_rect.height * scale_factor,
+                                ],
+                                color: [color.r, color.g, color.b, color.a * state.opacity],
+                            });
+                        }
+                    }
+                }
+                MaterialClass::Text => {
+                    for (primitive_index, primitive) in scene.primitives
+                        [batch.primitive_range.as_range()]
+                    .iter()
+                    .enumerate()
+                    {
+                        let primitive_index =
+                            batch.primitive_range.start as usize + primitive_index;
+                        let state = primitive_states[primitive_index];
+                        let Primitive::Text {
+                            bounds,
+                            layout,
+                            color,
+                        } = primitive
+                        else {
+                            continue;
+                        };
 
-                            match atlas_kind {
-                                GlyphAtlasKind::Mono => {
-                                    let glyph_color = glyph
-                                        .color_opt
-                                        .map(cosmic_to_style_color)
-                                        .unwrap_or(*color);
-                                    self.mono_text_instances.push(TextInstance {
-                                        rect,
-                                        uv_rect: entry.uv_rect,
-                                        color: [
-                                            glyph_color.r,
-                                            glyph_color.g,
-                                            glyph_color.b,
-                                            glyph_color.a,
-                                        ],
-                                    });
-                                }
-                                GlyphAtlasKind::Color => {
-                                    let alpha = glyph
-                                        .color_opt
-                                        .map(cosmic_to_style_color)
-                                        .unwrap_or(*color)
-                                        .a;
-                                    self.color_text_instances.push(ColorTextInstance {
-                                        rect,
-                                        uv_rect: entry.uv_rect,
-                                        alpha,
-                                    });
+                        for run in &layout.runs {
+                            for glyph in &run.glyphs {
+                                let physical = glyph.physical(
+                                    (
+                                        (bounds.x + state.offset[0]) * scale_factor,
+                                        (bounds.y + state.offset[1] + run.baseline) * scale_factor,
+                                    ),
+                                    scale_factor,
+                                );
+                                let Some((atlas_kind, entry)) =
+                                    self.ensure_glyph_entry(text_system, physical.cache_key)
+                                else {
+                                    continue;
+                                };
+                                let rect = crate::scene::LayoutBox {
+                                    x: (physical.x + entry.placement_left) as f32,
+                                    y: (physical.y - entry.placement_top) as f32,
+                                    width: entry.width as f32,
+                                    height: entry.height as f32,
+                                };
+                                let uv = crate::scene::LayoutBox {
+                                    x: entry.uv_rect[0],
+                                    y: entry.uv_rect[1],
+                                    width: entry.uv_rect[2],
+                                    height: entry.uv_rect[3],
+                                };
+                                let Some((clipped_rect, clipped_uv)) =
+                                    clip_text_glyph(rect, uv, state.clip)
+                                else {
+                                    continue;
+                                };
+                                let rect = [
+                                    clipped_rect.x,
+                                    clipped_rect.y,
+                                    clipped_rect.width,
+                                    clipped_rect.height,
+                                ];
+
+                                match atlas_kind {
+                                    GlyphAtlasKind::Mono => {
+                                        let glyph_color = glyph
+                                            .color_opt
+                                            .map(cosmic_to_style_color)
+                                            .unwrap_or(*color);
+                                        self.mono_text_instances.push(TextInstance {
+                                            rect,
+                                            uv_rect: [
+                                                clipped_uv.x,
+                                                clipped_uv.y,
+                                                clipped_uv.width,
+                                                clipped_uv.height,
+                                            ],
+                                            color: [
+                                                glyph_color.r,
+                                                glyph_color.g,
+                                                glyph_color.b,
+                                                glyph_color.a * state.opacity,
+                                            ],
+                                        });
+                                    }
+                                    GlyphAtlasKind::Color => {
+                                        let alpha = glyph
+                                            .color_opt
+                                            .map(cosmic_to_style_color)
+                                            .unwrap_or(*color)
+                                            .a;
+                                        self.color_text_instances.push(ColorTextInstance {
+                                            rect,
+                                            uv_rect: [
+                                                clipped_uv.x,
+                                                clipped_uv.y,
+                                                clipped_uv.width,
+                                                clipped_uv.height,
+                                            ],
+                                            alpha: alpha * state.opacity,
+                                        });
+                                    }
                                 }
                             }
                         }
@@ -563,6 +634,123 @@ impl RenderSystem {
             self.color_text_instance_capacity,
         );
     }
+}
+
+fn collect_primitive_states(scene: &CompiledScene) -> Vec<PrimitiveSceneState> {
+    let mut states = vec![PrimitiveSceneState::default(); scene.primitives.len()];
+    if !scene.scene_nodes.is_empty() {
+        assign_primitive_states(scene, SceneNodeId(0), [0.0, 0.0], 1.0, None, &mut states);
+    }
+    states
+}
+
+fn assign_primitive_states(
+    scene: &CompiledScene,
+    node_id: SceneNodeId,
+    parent_offset: [f32; 2],
+    parent_opacity: f32,
+    parent_clip: Option<crate::scene::LayoutBox>,
+    states: &mut [PrimitiveSceneState],
+) {
+    let node = &scene.scene_nodes[node_id.0 as usize];
+    let current_offset = [
+        parent_offset[0] + node.transform.tx,
+        parent_offset[1] + node.transform.ty,
+    ];
+    let current_opacity = parent_opacity * node.opacity;
+    let local_clip = node.clip.bounds.map(|bounds| crate::scene::LayoutBox {
+        x: bounds.x + current_offset[0],
+        y: bounds.y + current_offset[1],
+        width: bounds.width,
+        height: bounds.height,
+    });
+    let current_clip = intersect_clip(parent_clip, local_clip);
+
+    for primitive_index in node.primitive_range.as_range() {
+        states[primitive_index] = PrimitiveSceneState {
+            offset: current_offset,
+            opacity: current_opacity,
+            clip: current_clip,
+        };
+    }
+
+    let mut child = node.first_child;
+    while let Some(child_id) = child {
+        assign_primitive_states(
+            scene,
+            child_id,
+            current_offset,
+            current_opacity,
+            current_clip,
+            states,
+        );
+        child = scene.scene_nodes[child_id.0 as usize].next_sibling;
+    }
+}
+
+fn clip_rect(
+    rect: crate::scene::LayoutBox,
+    clip: Option<crate::scene::LayoutBox>,
+) -> Option<crate::scene::LayoutBox> {
+    clip.map_or(Some(rect), |clip| intersect_rect(rect, clip))
+}
+
+fn clip_text_glyph(
+    rect: crate::scene::LayoutBox,
+    uv: crate::scene::LayoutBox,
+    clip: Option<crate::scene::LayoutBox>,
+) -> Option<(crate::scene::LayoutBox, crate::scene::LayoutBox)> {
+    let clipped = clip_rect(rect, clip)?;
+    if rect.width <= 0.0 || rect.height <= 0.0 {
+        return None;
+    }
+
+    let left_ratio = (clipped.x - rect.x) / rect.width;
+    let top_ratio = (clipped.y - rect.y) / rect.height;
+    let right_ratio = (clipped.x + clipped.width - rect.x) / rect.width;
+    let bottom_ratio = (clipped.y + clipped.height - rect.y) / rect.height;
+
+    let clipped_uv = crate::scene::LayoutBox {
+        x: uv.x + uv.width * left_ratio,
+        y: uv.y + uv.height * top_ratio,
+        width: uv.width * (right_ratio - left_ratio),
+        height: uv.height * (bottom_ratio - top_ratio),
+    };
+
+    Some((clipped, clipped_uv))
+}
+
+fn intersect_clip(
+    a: Option<crate::scene::LayoutBox>,
+    b: Option<crate::scene::LayoutBox>,
+) -> Option<crate::scene::LayoutBox> {
+    match (a, b) {
+        (Some(a), Some(b)) => intersect_rect(a, b),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
+}
+
+fn intersect_rect(
+    a: crate::scene::LayoutBox,
+    b: crate::scene::LayoutBox,
+) -> Option<crate::scene::LayoutBox> {
+    let left = a.x.max(b.x);
+    let top = a.y.max(b.y);
+    let right = (a.x + a.width).min(b.x + b.width);
+    let bottom = (a.y + a.height).min(b.y + b.height);
+
+    if right <= left || bottom <= top {
+        return None;
+    }
+
+    Some(crate::scene::LayoutBox {
+        x: left,
+        y: top,
+        width: right - left,
+        height: bottom - top,
+    })
 }
 
 fn create_quad_pipeline(
