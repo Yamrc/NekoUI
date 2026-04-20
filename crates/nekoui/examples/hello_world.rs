@@ -19,6 +19,7 @@ fn main() -> Result<(), nekoui::Error> {
                         div()
                             .padding(EdgeInsets::all(20.0))
                             .bg(Color::rgb(0x1F2937))
+                            .corner_radius(8.0)
                             .child(
                                 text("Hello world!")
                                     .font_size(32.0)
@@ -33,7 +34,6 @@ fn main() -> Result<(), nekoui::Error> {
                                 bottom: 0.0,
                                 left: 20.0,
                             })
-                            .bg(Color::rgb(0xFFFFFF))
                             .child(
                                 text("这是一个简单示例喵 🍥")
                                     .font_size(24.0)

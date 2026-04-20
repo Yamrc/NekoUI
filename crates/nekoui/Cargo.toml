@@ -14,8 +14,8 @@ publish.workspace = true
 path = "src/lib.rs"
 
 [dependencies]
-accesskit.workspace = true
-accesskit_winit.workspace = true
+# accesskit = { workspace = true, optional = true }
+# accesskit_winit = { workspace = true, optional = true }
 bitflags.workspace = true
 bytemuck.workspace = true
 crossbeam-channel.workspace = true
@@ -25,7 +25,6 @@ hashbrown.workspace = true
 log.workspace = true
 parking_lot.workspace = true
 pollster.workspace = true
-ropey.workspace = true
 rustc-hash.workspace = true
 slotmap.workspace = true
 smallvec.workspace = true
@@ -34,6 +33,9 @@ taffy.workspace = true
 thiserror.workspace = true
 wgpu.workspace = true
 winit.workspace = true
+
+# [features]
+# a11y = ["dep:accesskit", "dep:accesskit_winit"]
 
 [dev-dependencies]
 env_logger = "0.11.10"

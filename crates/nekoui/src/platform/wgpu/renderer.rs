@@ -1,245 +1,41 @@
-use std::ops::Range;
+mod pipelines;
+mod prepare;
+mod submit;
+mod types;
+mod upload;
+
 use std::sync::Arc;
 
-use bytemuck::{Pod, Zeroable};
-use cosmic_text::{CacheKey, Color as CosmicColor, SwashCache};
+use bytemuck::bytes_of;
+use cosmic_text::{Color as CosmicColor, SwashCache};
 use wgpu::util::{DeviceExt, StagingBelt};
 use wgpu::{
     BindGroup, BindGroupDescriptor, BindGroupEntry, BindGroupLayout, BindGroupLayoutDescriptor,
-    BindGroupLayoutEntry, BindingType, BlendState, Buffer, BufferBindingType, BufferSize,
-    ColorTargetState, ColorWrites, Device, FragmentState, LoadOp, MultisampleState, Operations,
-    PipelineCompilationOptions, PipelineLayoutDescriptor, PrimitiveState,
-    RenderPassColorAttachment, RenderPassDescriptor, RenderPipeline, RenderPipelineDescriptor,
-    ShaderModuleDescriptor, ShaderSource, ShaderStages, StoreOp, SurfaceConfiguration,
-    TextureFormat, TextureViewDescriptor, VertexBufferLayout, VertexState, VertexStepMode,
-    vertex_attr_array,
+    BindGroupLayoutEntry, BindingType, Buffer, BufferBindingType, ShaderStages,
+    TextureViewDescriptor,
 };
 use winit::window::Window as WinitWindow;
 
 use crate::error::PlatformError;
-use crate::platform::wgpu::atlas::{AtlasEntry, GlyphAtlas, GlyphAtlasKind};
+use crate::platform::wgpu::atlas::GlyphAtlas;
 use crate::platform::wgpu::context::WgpuContext;
-use crate::platform::wgpu::shader::{RECT_SHADER, TEXT_SHADER};
-use crate::scene::{
-    ClipClass, CompiledScene, EffectClass, LogicalBatch, MaterialClass, Primitive, SceneNodeId,
-};
+use crate::scene::CompiledScene;
 use crate::style::Color;
 use crate::text_system::TextSystem;
 use crate::window::WindowSize;
 
+use self::pipelines::{create_rect_bind_group_layout, create_text_texture_bind_group_layout};
+use self::types::{ColorTextInstance, RectInstance, TextInstance, ViewUniform};
+use self::upload::{
+    create_instance_buffer, create_rect_bind_group, create_storage_buffer, stage_write_bytes,
+    stage_write_pod_slice,
+};
+
+pub(crate) use self::types::{RenderOutcome, WindowRenderState};
+
 const ATLAS_SIZE: u32 = 2048;
 const STAGING_BELT_CHUNK_SIZE: u64 = 64 * 1024;
 const SHRINK_IDLE_FRAME_THRESHOLD: u32 = 90;
-
-#[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
-struct ViewUniform {
-    viewport: [f32; 2],
-    _pad: [f32; 2],
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
-struct RectInstance {
-    rect: [f32; 4],
-    fill_start_color: [f32; 4],
-    fill_end_color: [f32; 4],
-    fill_meta: [f32; 4],
-    corner_radii: [f32; 4],
-    border_widths: [f32; 4],
-    border_color: [f32; 4],
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
-struct TextInstance {
-    rect: [f32; 4],
-    uv_rect: [f32; 4],
-    color: [f32; 4],
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
-struct ColorTextInstance {
-    rect: [f32; 4],
-    uv_rect: [f32; 4],
-    alpha: f32,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PipelineKey {
-    Rect,
-    MonoText,
-    ColorText,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TextureBindingKey {
-    None,
-    MonoGlyphAtlas(u32),
-    ColorGlyphAtlas(u32),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ActiveBatch {
-    pipeline_key: PipelineKey,
-    texture_binding: TextureBindingKey,
-    start: u32,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-struct GpuBatch {
-    pipeline_key: PipelineKey,
-    texture_binding: TextureBindingKey,
-    clip_class: ClipClass,
-    clip_bounds: Option<crate::scene::LayoutBox>,
-    effect_class: EffectClass,
-    instance_range: Range<u32>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BatchClipPolicy {
-    None,
-    Rect,
-}
-
-impl From<ClipClass> for BatchClipPolicy {
-    fn from(value: ClipClass) -> Self {
-        match value {
-            ClipClass::None => Self::None,
-            ClipClass::Rect => Self::Rect,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BatchEffectPolicy {
-    None,
-    Opacity,
-}
-
-impl From<EffectClass> for BatchEffectPolicy {
-    fn from(value: EffectClass) -> Self {
-        match value {
-            EffectClass::None => Self::None,
-            EffectClass::Opacity => Self::Opacity,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum EffectRenderPolicy {
-    Direct,
-    InlineOpacity,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct BatchSubmitState {
-    pipeline_key: PipelineKey,
-    texture_binding: TextureBindingKey,
-    clip_policy: BatchClipPolicy,
-    clip_bounds: Option<crate::scene::LayoutBox>,
-    effect_policy: BatchEffectPolicy,
-    effect_render_policy: EffectRenderPolicy,
-}
-
-impl From<&GpuBatch> for BatchSubmitState {
-    fn from(batch: &GpuBatch) -> Self {
-        let effect_policy: BatchEffectPolicy = batch.effect_class.into();
-        Self {
-            pipeline_key: batch.pipeline_key,
-            texture_binding: batch.texture_binding,
-            clip_policy: batch.clip_class.into(),
-            clip_bounds: batch.clip_bounds,
-            effect_policy,
-            effect_render_policy: effect_render_policy(effect_policy),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ScissorRect {
-    x: u32,
-    y: u32,
-    width: u32,
-    height: u32,
-}
-
-#[derive(Default)]
-struct GpuBatchBuilder {
-    batches: Vec<GpuBatch>,
-}
-
-impl GpuBatchBuilder {
-    fn push(&mut self, batch: GpuBatch) {
-        if batch.instance_range.is_empty() {
-            return;
-        }
-
-        if let Some(previous) = self.batches.last_mut()
-            && can_merge_gpu_batches(previous, &batch)
-        {
-            previous.instance_range.end = batch.instance_range.end;
-            return;
-        }
-
-        self.batches.push(batch);
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-struct SceneWalkState {
-    offset: [f32; 2],
-    opacity: f32,
-    clip: Option<crate::scene::LayoutBox>,
-}
-
-struct TextPrimitiveParams<'a> {
-    bounds: &'a crate::scene::LayoutBox,
-    layout: &'a crate::text_system::TextLayout,
-    color: &'a Color,
-    scene_state: SceneWalkState,
-    batch: &'a LogicalBatch,
-}
-
-struct LogicalBatchCursor<'a> {
-    batches: &'a [LogicalBatch],
-    index: usize,
-}
-
-impl<'a> LogicalBatchCursor<'a> {
-    fn new(batches: &'a [LogicalBatch]) -> Self {
-        Self { batches, index: 0 }
-    }
-
-    fn batch_for_primitive(&mut self, primitive_index: u32) -> &'a LogicalBatch {
-        while self.index + 1 < self.batches.len()
-            && primitive_index >= self.batches[self.index].primitive_range.end
-        {
-            self.index += 1;
-        }
-
-        let batch = &self.batches[self.index];
-        debug_assert!(batch.primitive_range.start <= primitive_index);
-        debug_assert!(primitive_index < batch.primitive_range.end);
-        batch
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub enum RenderOutcome {
-    Presented,
-    Reconfigure,
-    RecreateSurface,
-    Unavailable,
-}
-
-pub struct WindowRenderState {
-    surface: wgpu::Surface<'static>,
-    config: SurfaceConfiguration,
-    current_size: WindowSize,
-    suspended: bool,
-}
 
 pub struct RenderSystem {
     context: WgpuContext,
@@ -247,9 +43,11 @@ pub struct RenderSystem {
     view_buffer: Buffer,
     view_bind_group_layout: BindGroupLayout,
     view_bind_group: BindGroup,
-    rect_pipeline: RenderPipeline,
-    mono_text_pipeline: RenderPipeline,
-    color_text_pipeline: RenderPipeline,
+    rect_bind_group_layout: BindGroupLayout,
+    rect_bind_group: BindGroup,
+    rect_pipeline: wgpu::RenderPipeline,
+    mono_text_pipeline: wgpu::RenderPipeline,
+    color_text_pipeline: wgpu::RenderPipeline,
     text_texture_bind_group_layout: BindGroupLayout,
     mono_atlas: GlyphAtlas,
     color_atlas: GlyphAtlas,
@@ -257,8 +55,8 @@ pub struct RenderSystem {
     rect_instances: Vec<RectInstance>,
     mono_text_instances: Vec<TextInstance>,
     color_text_instances: Vec<ColorTextInstance>,
-    gpu_batches: Vec<GpuBatch>,
-    rect_instance_buffer: Buffer,
+    gpu_batches: Vec<types::GpuBatch>,
+    rect_storage_buffer: Buffer,
     mono_text_instance_buffer: Buffer,
     color_text_instance_buffer: Buffer,
     rect_instance_capacity: usize,
@@ -267,7 +65,8 @@ pub struct RenderSystem {
     rect_low_usage_frames: u32,
     mono_text_low_usage_frames: u32,
     color_text_low_usage_frames: u32,
-    current_surface_format: TextureFormat,
+    current_surface_format: Option<wgpu::TextureFormat>,
+    buffer_epoch: u64,
 }
 
 impl RenderSystem {
@@ -297,7 +96,7 @@ impl RenderSystem {
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("nekoui_view_uniform"),
-                contents: bytemuck::bytes_of(&ViewUniform {
+                contents: bytes_of(&ViewUniform {
                     viewport: [
                         physical_size.width.max(1) as f32,
                         physical_size.height.max(1) as f32,
@@ -314,45 +113,44 @@ impl RenderSystem {
                 resource: view_buffer.as_entire_binding(),
             }],
         });
-
+        let rect_bind_group_layout = create_rect_bind_group_layout(&context.device);
         let text_texture_bind_group_layout = create_text_texture_bind_group_layout(&context.device);
         let mono_atlas = GlyphAtlas::new(
             &context.device,
             &text_texture_bind_group_layout,
-            GlyphAtlasKind::Mono,
+            crate::platform::wgpu::atlas::GlyphAtlasKind::Mono,
             ATLAS_SIZE.min(context.max_texture_size),
         )?;
         let color_atlas = GlyphAtlas::new(
             &context.device,
             &text_texture_bind_group_layout,
-            GlyphAtlasKind::Color,
+            crate::platform::wgpu::atlas::GlyphAtlasKind::Color,
             ATLAS_SIZE.min(context.max_texture_size),
         )?;
-        let rect_pipeline = create_rect_pipeline(
-            &context.device,
-            &view_bind_group_layout,
-            TextureFormat::Bgra8UnormSrgb,
+        let initial_extent = WindowSize::new(
+            physical_size.width.max(1).min(context.max_texture_size),
+            physical_size.height.max(1).min(context.max_texture_size),
         );
-        let mono_text_pipeline = create_mono_text_pipeline(
-            &context.device,
-            &view_bind_group_layout,
-            &text_texture_bind_group_layout,
-            TextureFormat::Bgra8UnormSrgb,
-        );
-        let color_text_pipeline = create_color_text_pipeline(
-            &context.device,
-            &view_bind_group_layout,
-            &text_texture_bind_group_layout,
-            TextureFormat::Bgra8UnormSrgb,
-        );
-
+        let initial_surface_format = surface
+            .get_default_config(
+                &context.adapter,
+                initial_extent.width,
+                initial_extent.height,
+            )
+            .ok_or_else(|| PlatformError::new("surface has no default configuration"))?
+            .format;
         let rect_instance_capacity = 64;
         let mono_text_instance_capacity = 256;
         let color_text_instance_capacity = 64;
-        let rect_instance_buffer = create_instance_buffer::<RectInstance>(
+        let rect_storage_buffer = create_storage_buffer::<RectInstance>(
             &context.device,
             "nekoui_rect_instances",
             rect_instance_capacity,
+        );
+        let rect_bind_group = create_rect_bind_group(
+            &context.device,
+            &rect_bind_group_layout,
+            &rect_storage_buffer,
         );
         let mono_text_instance_buffer = create_instance_buffer::<TextInstance>(
             &context.device,
@@ -365,6 +163,24 @@ impl RenderSystem {
             color_text_instance_capacity,
         );
         let staging_device = context.device.clone();
+        let rect_pipeline = pipelines::create_rect_pipeline(
+            &context.device,
+            &view_bind_group_layout,
+            &rect_bind_group_layout,
+            initial_surface_format,
+        );
+        let mono_text_pipeline = pipelines::create_mono_text_pipeline(
+            &context.device,
+            &view_bind_group_layout,
+            &text_texture_bind_group_layout,
+            initial_surface_format,
+        );
+        let color_text_pipeline = pipelines::create_color_text_pipeline(
+            &context.device,
+            &view_bind_group_layout,
+            &text_texture_bind_group_layout,
+            initial_surface_format,
+        );
 
         let mut render_system = Self {
             context,
@@ -372,6 +188,8 @@ impl RenderSystem {
             view_buffer,
             view_bind_group_layout,
             view_bind_group,
+            rect_bind_group_layout,
+            rect_bind_group,
             rect_pipeline,
             mono_text_pipeline,
             color_text_pipeline,
@@ -383,7 +201,7 @@ impl RenderSystem {
             mono_text_instances: Vec::new(),
             color_text_instances: Vec::new(),
             gpu_batches: Vec::new(),
-            rect_instance_buffer,
+            rect_storage_buffer,
             mono_text_instance_buffer,
             color_text_instance_buffer,
             rect_instance_capacity,
@@ -392,7 +210,8 @@ impl RenderSystem {
             rect_low_usage_frames: 0,
             mono_text_low_usage_frames: 0,
             color_text_low_usage_frames: 0,
-            current_surface_format: TextureFormat::Bgra8UnormSrgb,
+            current_surface_format: Some(initial_surface_format),
+            buffer_epoch: 1,
         };
         let render_state = render_system.create_window_state(surface, physical_size)?;
         Ok((render_system, render_state))
@@ -426,6 +245,7 @@ impl RenderSystem {
             config,
             current_size,
             suspended: false,
+            prepared_frame: None,
         })
     }
 
@@ -486,19 +306,21 @@ impl RenderSystem {
             self.resize(state, state.current_size)?;
         }
 
-        self.rect_instances.clear();
-        self.mono_text_instances.clear();
-        self.color_text_instances.clear();
-        self.gpu_batches.clear();
-        self.mono_atlas.begin_frame();
-        self.color_atlas.begin_frame();
-        self.collect_instances(scene, text_system, scale_factor as f32);
-        self.ensure_rect_capacity(self.rect_instances.len());
-        self.ensure_mono_text_capacity(self.mono_text_instances.len());
-        self.ensure_color_text_capacity(self.color_text_instances.len());
-        self.maybe_shrink_rect_capacity(self.rect_instances.len());
-        self.maybe_shrink_mono_text_capacity(self.mono_text_instances.len());
-        self.maybe_shrink_color_text_capacity(self.color_text_instances.len());
+        self.prepare_frame(state, scene, text_system, scale_factor as f32);
+        let prepared = state
+            .prepared_frame
+            .as_ref()
+            .expect("prepared frame must exist before rendering");
+        self.ensure_rect_capacity(prepared.rect_instances.len());
+        self.ensure_mono_text_capacity(prepared.mono_text_instances.len());
+        self.ensure_color_text_capacity(prepared.color_text_instances.len());
+        self.maybe_shrink_rect_capacity(prepared.rect_instances.len());
+        self.maybe_shrink_mono_text_capacity(prepared.mono_text_instances.len());
+        self.maybe_shrink_color_text_capacity(prepared.color_text_instances.len());
+        let uploads_required = state
+            .prepared_frame
+            .as_ref()
+            .is_some_and(|prepared| prepared.uploaded_buffer_epoch != self.buffer_epoch);
 
         let frame = match state.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame) => frame,
@@ -534,43 +356,49 @@ impl RenderSystem {
             &mut self.staging_belt,
             &mut encoder,
             &self.view_buffer,
-            bytemuck::bytes_of(&ViewUniform {
+            bytes_of(&ViewUniform {
                 viewport: [state.config.width as f32, state.config.height as f32],
                 _pad: [0.0; 2],
             }),
         );
-        stage_write_pod_slice(
-            &mut self.staging_belt,
-            &mut encoder,
-            &self.rect_instance_buffer,
-            &self.rect_instances,
-        );
-        stage_write_pod_slice(
-            &mut self.staging_belt,
-            &mut encoder,
-            &self.mono_text_instance_buffer,
-            &self.mono_text_instances,
-        );
-        stage_write_pod_slice(
-            &mut self.staging_belt,
-            &mut encoder,
-            &self.color_text_instance_buffer,
-            &self.color_text_instances,
-        );
+        if uploads_required {
+            let prepared = state
+                .prepared_frame
+                .as_ref()
+                .expect("prepared frame must exist for uploads");
+            stage_write_pod_slice(
+                &mut self.staging_belt,
+                &mut encoder,
+                &self.rect_storage_buffer,
+                &prepared.rect_instances,
+            );
+            stage_write_pod_slice(
+                &mut self.staging_belt,
+                &mut encoder,
+                &self.mono_text_instance_buffer,
+                &prepared.mono_text_instances,
+            );
+            stage_write_pod_slice(
+                &mut self.staging_belt,
+                &mut encoder,
+                &self.color_text_instance_buffer,
+                &prepared.color_text_instances,
+            );
+        }
         self.staging_belt.finish();
 
         {
-            let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("nekoui_render_pass"),
-                color_attachments: &[Some(RenderPassColorAttachment {
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
                     resolve_target: None,
                     depth_slice: None,
-                    ops: Operations {
-                        load: LoadOp::Clear(color_to_wgpu(
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(color_to_wgpu(
                             scene.clear_color.unwrap_or(Color::rgba(1.0, 1.0, 1.0, 1.0)),
                         )),
-                        store: StoreOp::Store,
+                        store: wgpu::StoreOp::Store,
                     },
                 })],
                 depth_stencil_attachment: None,
@@ -580,24 +408,29 @@ impl RenderSystem {
             });
 
             let mut current_submit_state = None;
-            for batch in &self.gpu_batches {
-                let submit_state = BatchSubmitState::from(batch);
+            for batch in &state
+                .prepared_frame
+                .as_ref()
+                .expect("prepared frame must exist during submit")
+                .gpu_batches
+            {
+                let submit_state = types::BatchSubmitState::from(batch);
                 if current_submit_state != Some(submit_state) {
                     if current_submit_state.map(|state| state.pipeline_key)
                         != Some(submit_state.pipeline_key)
                     {
                         match submit_state.pipeline_key {
-                            PipelineKey::Rect => {
+                            types::PipelineKey::Rect => {
                                 pass.set_pipeline(&self.rect_pipeline);
                                 pass.set_bind_group(0, &self.view_bind_group, &[]);
-                                pass.set_vertex_buffer(0, self.rect_instance_buffer.slice(..));
+                                pass.set_bind_group(1, &self.rect_bind_group, &[]);
                             }
-                            PipelineKey::MonoText => {
+                            types::PipelineKey::MonoText => {
                                 pass.set_pipeline(&self.mono_text_pipeline);
                                 pass.set_bind_group(0, &self.view_bind_group, &[]);
                                 pass.set_vertex_buffer(0, self.mono_text_instance_buffer.slice(..));
                             }
-                            PipelineKey::ColorText => {
+                            types::PipelineKey::ColorText => {
                                 pass.set_pipeline(&self.color_text_pipeline);
                                 pass.set_bind_group(0, &self.view_bind_group, &[]);
                                 pass.set_vertex_buffer(
@@ -612,14 +445,14 @@ impl RenderSystem {
                         != Some(submit_state.texture_binding)
                     {
                         match submit_state.texture_binding {
-                            TextureBindingKey::None => {}
-                            TextureBindingKey::MonoGlyphAtlas(page_id) => {
+                            types::TextureBindingKey::None => {}
+                            types::TextureBindingKey::MonoGlyphAtlas(page_id) => {
                                 let Some(bind_group) = self.mono_atlas.bind_group(page_id) else {
                                     continue;
                                 };
                                 pass.set_bind_group(1, bind_group, &[]);
                             }
-                            TextureBindingKey::ColorGlyphAtlas(page_id) => {
+                            types::TextureBindingKey::ColorGlyphAtlas(page_id) => {
                                 let Some(bind_group) = self.color_atlas.bind_group(page_id) else {
                                     continue;
                                 };
@@ -629,11 +462,11 @@ impl RenderSystem {
                     }
 
                     match submit_state.clip_policy {
-                        BatchClipPolicy::None => {
+                        types::BatchClipPolicy::None => {
                             pass.set_scissor_rect(0, 0, state.config.width, state.config.height);
                         }
-                        BatchClipPolicy::Rect => {
-                            let Some(scissor) = clip_bounds_to_scissor_rect(
+                        types::BatchClipPolicy::Rect => {
+                            let Some(scissor) = submit::clip_bounds_to_scissor_rect(
                                 submit_state.clip_bounds,
                                 scale_factor as f32,
                                 state.config.width,
@@ -653,11 +486,14 @@ impl RenderSystem {
                     current_submit_state = Some(submit_state);
                 }
                 match submit_state.effect_render_policy {
-                    EffectRenderPolicy::Direct => {
-                        draw_gpu_batch(&mut pass, batch.instance_range.clone());
+                    types::EffectRenderPolicy::Direct => {
+                        submit::draw_gpu_batch(&mut pass, batch.instance_range.clone());
                     }
-                    EffectRenderPolicy::InlineOpacity => {
-                        draw_gpu_batch_inline_opacity(&mut pass, batch.instance_range.clone());
+                    types::EffectRenderPolicy::InlineOpacity => {
+                        submit::draw_gpu_batch_inline_opacity(
+                            &mut pass,
+                            batch.instance_range.clone(),
+                        );
                     }
                 }
             }
@@ -666,67 +502,11 @@ impl RenderSystem {
         window.pre_present_notify();
         self.context.queue.submit(Some(encoder.finish()));
         self.staging_belt.recall();
+        if uploads_required && let Some(prepared) = state.prepared_frame.as_mut() {
+            prepared.uploaded_buffer_epoch = self.buffer_epoch;
+        }
         frame.present();
         Ok(RenderOutcome::Presented)
-    }
-
-    fn collect_instances(
-        &mut self,
-        scene: &CompiledScene,
-        text_system: &mut TextSystem,
-        scale_factor: f32,
-    ) {
-        let scale_factor = scale_factor.max(f32::MIN_POSITIVE);
-        if scene.scene_nodes.is_empty()
-            || scene.primitives.is_empty()
-            || scene.logical_batches.is_empty()
-        {
-            return;
-        }
-
-        let mut batch_cursor = LogicalBatchCursor::new(&scene.logical_batches);
-        self.collect_node_instances(
-            scene,
-            text_system,
-            scale_factor,
-            SceneNodeId(0),
-            SceneWalkState {
-                offset: [0.0, 0.0],
-                opacity: 1.0,
-                clip: None,
-            },
-            &mut batch_cursor,
-        );
-    }
-
-    fn ensure_glyph_entry(
-        &mut self,
-        text_system: &mut TextSystem,
-        cache_key: CacheKey,
-    ) -> Option<(GlyphAtlasKind, AtlasEntry)> {
-        if let Some(entry) = self.mono_atlas.get(&cache_key) {
-            return Some((GlyphAtlasKind::Mono, entry));
-        }
-        if let Some(entry) = self.color_atlas.get(&cache_key) {
-            return Some((GlyphAtlasKind::Color, entry));
-        }
-
-        let image = self
-            .swash_cache
-            .get_image(text_system.font_system_mut(), cache_key)
-            .as_ref()?
-            .clone();
-
-        match image.content {
-            cosmic_text::SwashContent::Color => self
-                .color_atlas
-                .upload_color(&self.context.device, &self.context.queue, cache_key, &image)
-                .map(|entry| (GlyphAtlasKind::Color, entry)),
-            cosmic_text::SwashContent::Mask | cosmic_text::SwashContent::SubpixelMask => self
-                .mono_atlas
-                .upload_mask(&self.context.device, &self.context.queue, cache_key, &image)
-                .map(|entry| (GlyphAtlasKind::Mono, entry)),
-        }
     }
 
     fn surface_extent_for(&self, physical_size: WindowSize) -> WindowSize {
@@ -736,816 +516,6 @@ impl RenderSystem {
             physical_size.height.max(1).min(max),
         )
     }
-
-    fn ensure_pipelines_for_format(&mut self, surface_format: TextureFormat) {
-        if self.current_surface_format == surface_format {
-            return;
-        }
-        self.rect_pipeline = create_rect_pipeline(
-            &self.context.device,
-            &self.view_bind_group_layout,
-            surface_format,
-        );
-        self.mono_text_pipeline = create_mono_text_pipeline(
-            &self.context.device,
-            &self.view_bind_group_layout,
-            &self.text_texture_bind_group_layout,
-            surface_format,
-        );
-        self.color_text_pipeline = create_color_text_pipeline(
-            &self.context.device,
-            &self.view_bind_group_layout,
-            &self.text_texture_bind_group_layout,
-            surface_format,
-        );
-        self.current_surface_format = surface_format;
-    }
-
-    fn ensure_rect_capacity(&mut self, count: usize) {
-        if count <= self.rect_instance_capacity {
-            return;
-        }
-        while self.rect_instance_capacity < count {
-            self.rect_instance_capacity *= 2;
-        }
-        self.rect_instance_buffer = create_instance_buffer::<RectInstance>(
-            &self.context.device,
-            "nekoui_rect_instances",
-            self.rect_instance_capacity,
-        );
-    }
-
-    fn maybe_shrink_rect_capacity(&mut self, count: usize) {
-        maybe_shrink_instance_buffer::<RectInstance>(
-            &self.context.device,
-            count,
-            64,
-            &mut self.rect_instance_capacity,
-            &mut self.rect_low_usage_frames,
-            &mut self.rect_instance_buffer,
-            "nekoui_rect_instances",
-        );
-    }
-
-    fn ensure_mono_text_capacity(&mut self, count: usize) {
-        if count <= self.mono_text_instance_capacity {
-            return;
-        }
-        while self.mono_text_instance_capacity < count {
-            self.mono_text_instance_capacity *= 2;
-        }
-        self.mono_text_instance_buffer = create_instance_buffer::<TextInstance>(
-            &self.context.device,
-            "nekoui_mono_text_instances",
-            self.mono_text_instance_capacity,
-        );
-    }
-
-    fn maybe_shrink_mono_text_capacity(&mut self, count: usize) {
-        maybe_shrink_instance_buffer::<TextInstance>(
-            &self.context.device,
-            count,
-            256,
-            &mut self.mono_text_instance_capacity,
-            &mut self.mono_text_low_usage_frames,
-            &mut self.mono_text_instance_buffer,
-            "nekoui_mono_text_instances",
-        );
-    }
-
-    fn ensure_color_text_capacity(&mut self, count: usize) {
-        if count <= self.color_text_instance_capacity {
-            return;
-        }
-        while self.color_text_instance_capacity < count {
-            self.color_text_instance_capacity *= 2;
-        }
-        self.color_text_instance_buffer = create_instance_buffer::<ColorTextInstance>(
-            &self.context.device,
-            "nekoui_color_text_instances",
-            self.color_text_instance_capacity,
-        );
-    }
-
-    fn maybe_shrink_color_text_capacity(&mut self, count: usize) {
-        maybe_shrink_instance_buffer::<ColorTextInstance>(
-            &self.context.device,
-            count,
-            64,
-            &mut self.color_text_instance_capacity,
-            &mut self.color_text_low_usage_frames,
-            &mut self.color_text_instance_buffer,
-            "nekoui_color_text_instances",
-        );
-    }
-
-    fn start_or_switch_batch(
-        &mut self,
-        active_batch: &mut Option<ActiveBatch>,
-        pipeline_key: PipelineKey,
-        texture_binding: TextureBindingKey,
-        clip_class: ClipClass,
-        clip_bounds: Option<crate::scene::LayoutBox>,
-        effect_class: EffectClass,
-    ) {
-        let next_batch = ActiveBatch {
-            pipeline_key,
-            texture_binding,
-            start: self.instance_count_for(pipeline_key),
-        };
-
-        if matches!(
-            active_batch,
-            Some(active)
-                if active.pipeline_key == next_batch.pipeline_key
-                    && active.texture_binding == next_batch.texture_binding
-        ) {
-            return;
-        }
-
-        self.finish_active_batch(active_batch, clip_class, clip_bounds, effect_class);
-        *active_batch = Some(next_batch);
-    }
-
-    fn finish_active_batch(
-        &mut self,
-        active_batch: &mut Option<ActiveBatch>,
-        clip_class: ClipClass,
-        clip_bounds: Option<crate::scene::LayoutBox>,
-        effect_class: EffectClass,
-    ) {
-        let Some(active_batch) = active_batch.take() else {
-            return;
-        };
-
-        self.push_gpu_batch(
-            active_batch.pipeline_key,
-            active_batch.texture_binding,
-            clip_class,
-            clip_bounds,
-            effect_class,
-            active_batch.start..self.instance_count_for(active_batch.pipeline_key),
-        );
-    }
-
-    fn push_gpu_batch(
-        &mut self,
-        pipeline_key: PipelineKey,
-        texture_binding: TextureBindingKey,
-        clip_class: ClipClass,
-        clip_bounds: Option<crate::scene::LayoutBox>,
-        effect_class: EffectClass,
-        instance_range: Range<u32>,
-    ) {
-        push_gpu_batch(
-            &mut self.gpu_batches,
-            GpuBatch {
-                pipeline_key,
-                texture_binding,
-                clip_class,
-                clip_bounds,
-                effect_class,
-                instance_range,
-            },
-        );
-    }
-
-    fn instance_count_for(&self, pipeline_key: PipelineKey) -> u32 {
-        match pipeline_key {
-            PipelineKey::Rect => self.rect_instances.len() as u32,
-            PipelineKey::MonoText => self.mono_text_instances.len() as u32,
-            PipelineKey::ColorText => self.color_text_instances.len() as u32,
-        }
-    }
-
-    fn collect_node_instances(
-        &mut self,
-        scene: &CompiledScene,
-        text_system: &mut TextSystem,
-        scale_factor: f32,
-        node_id: SceneNodeId,
-        parent_state: SceneWalkState,
-        batch_cursor: &mut LogicalBatchCursor<'_>,
-    ) {
-        let node = &scene.scene_nodes[node_id.0 as usize];
-        let current_offset = [
-            parent_state.offset[0] + node.transform.tx,
-            parent_state.offset[1] + node.transform.ty,
-        ];
-        let current_opacity = parent_state.opacity * node.opacity;
-        let local_clip = node.clip.bounds.map(|bounds| crate::scene::LayoutBox {
-            x: bounds.x + current_offset[0],
-            y: bounds.y + current_offset[1],
-            width: bounds.width,
-            height: bounds.height,
-        });
-        let current_state = SceneWalkState {
-            offset: current_offset,
-            opacity: current_opacity,
-            clip: intersect_clip(parent_state.clip, local_clip),
-        };
-
-        for primitive_index in node.primitive_range.as_range() {
-            let batch = batch_cursor.batch_for_primitive(primitive_index as u32);
-            match &scene.primitives[primitive_index] {
-                Primitive::Rect(rect_primitive) => {
-                    debug_assert_eq!(batch.material_class, MaterialClass::Rect);
-                    let start = self.rect_instances.len() as u32;
-                    let (fill_start_color, fill_end_color, fill_meta) = match rect_primitive.fill {
-                        crate::scene::RectFill::Solid(color) => {
-                            (color, color, [0.0, 0.0, 0.0, 0.0])
-                        }
-                        crate::scene::RectFill::LinearGradient(gradient) => (
-                            gradient.start_color,
-                            gradient.end_color,
-                            [1.0, gradient.angle_radians, 0.0, 0.0],
-                        ),
-                    };
-                    let rect_bounds = crate::scene::LayoutBox {
-                        x: rect_primitive.bounds.x + current_state.offset[0],
-                        y: rect_primitive.bounds.y + current_state.offset[1],
-                        width: rect_primitive.bounds.width,
-                        height: rect_primitive.bounds.height,
-                    };
-                    let Some(clipped_rect) = clip_rect(rect_bounds, current_state.clip) else {
-                        continue;
-                    };
-                    self.rect_instances.push(RectInstance {
-                        rect: [
-                            clipped_rect.x * scale_factor,
-                            clipped_rect.y * scale_factor,
-                            clipped_rect.width * scale_factor,
-                            clipped_rect.height * scale_factor,
-                        ],
-                        fill_start_color: [
-                            fill_start_color.r,
-                            fill_start_color.g,
-                            fill_start_color.b,
-                            fill_start_color.a * current_state.opacity,
-                        ],
-                        fill_end_color: [
-                            fill_end_color.r,
-                            fill_end_color.g,
-                            fill_end_color.b,
-                            fill_end_color.a * current_state.opacity,
-                        ],
-                        fill_meta,
-                        corner_radii: [
-                            rect_primitive.corner_radii.top_left * scale_factor,
-                            rect_primitive.corner_radii.top_right * scale_factor,
-                            rect_primitive.corner_radii.bottom_right * scale_factor,
-                            rect_primitive.corner_radii.bottom_left * scale_factor,
-                        ],
-                        border_widths: [
-                            rect_primitive.border_widths.top * scale_factor,
-                            rect_primitive.border_widths.right * scale_factor,
-                            rect_primitive.border_widths.bottom * scale_factor,
-                            rect_primitive.border_widths.left * scale_factor,
-                        ],
-                        border_color: rect_primitive
-                            .border_color
-                            .map(|border_color| {
-                                [
-                                    border_color.r,
-                                    border_color.g,
-                                    border_color.b,
-                                    border_color.a * current_state.opacity,
-                                ]
-                            })
-                            .unwrap_or([0.0; 4]),
-                    });
-                    self.push_gpu_batch(
-                        PipelineKey::Rect,
-                        TextureBindingKey::None,
-                        batch.clip_class,
-                        current_state.clip,
-                        batch.effect_class,
-                        start..self.rect_instances.len() as u32,
-                    );
-                }
-                Primitive::Text {
-                    bounds,
-                    layout,
-                    color,
-                } => {
-                    debug_assert_eq!(batch.material_class, MaterialClass::Text);
-                    self.collect_text_primitive_instances(
-                        text_system,
-                        scale_factor,
-                        TextPrimitiveParams {
-                            bounds,
-                            layout,
-                            color,
-                            scene_state: current_state,
-                            batch,
-                        },
-                    );
-                }
-            }
-        }
-
-        let mut child = node.first_child;
-        while let Some(child_id) = child {
-            self.collect_node_instances(
-                scene,
-                text_system,
-                scale_factor,
-                child_id,
-                current_state,
-                batch_cursor,
-            );
-            child = scene.scene_nodes[child_id.0 as usize].next_sibling;
-        }
-    }
-
-    fn collect_text_primitive_instances(
-        &mut self,
-        text_system: &mut TextSystem,
-        scale_factor: f32,
-        params: TextPrimitiveParams<'_>,
-    ) {
-        let mut active_batch = None;
-
-        for run in &params.layout.runs {
-            for glyph in &run.glyphs {
-                let physical = glyph.physical(
-                    (
-                        (params.bounds.x + params.scene_state.offset[0]) * scale_factor,
-                        (params.bounds.y + params.scene_state.offset[1] + run.baseline)
-                            * scale_factor,
-                    ),
-                    scale_factor,
-                );
-                let Some((atlas_kind, entry)) =
-                    self.ensure_glyph_entry(text_system, physical.cache_key)
-                else {
-                    continue;
-                };
-                let rect = crate::scene::LayoutBox {
-                    x: (physical.x + entry.placement_left) as f32,
-                    y: (physical.y - entry.placement_top) as f32,
-                    width: entry.width as f32,
-                    height: entry.height as f32,
-                };
-                let uv = crate::scene::LayoutBox {
-                    x: entry.uv_rect[0],
-                    y: entry.uv_rect[1],
-                    width: entry.uv_rect[2],
-                    height: entry.uv_rect[3],
-                };
-                let Some((clipped_rect, clipped_uv)) =
-                    clip_text_glyph(rect, uv, params.scene_state.clip)
-                else {
-                    continue;
-                };
-                let rect = [
-                    clipped_rect.x,
-                    clipped_rect.y,
-                    clipped_rect.width,
-                    clipped_rect.height,
-                ];
-                let glyph_color = glyph
-                    .color_opt
-                    .map(cosmic_to_style_color)
-                    .unwrap_or(*params.color);
-
-                match atlas_kind {
-                    GlyphAtlasKind::Mono => {
-                        self.start_or_switch_batch(
-                            &mut active_batch,
-                            PipelineKey::MonoText,
-                            TextureBindingKey::MonoGlyphAtlas(entry.page_id),
-                            params.batch.clip_class,
-                            params.scene_state.clip,
-                            params.batch.effect_class,
-                        );
-                        self.mono_text_instances.push(TextInstance {
-                            rect,
-                            uv_rect: [
-                                clipped_uv.x,
-                                clipped_uv.y,
-                                clipped_uv.width,
-                                clipped_uv.height,
-                            ],
-                            color: [
-                                glyph_color.r,
-                                glyph_color.g,
-                                glyph_color.b,
-                                glyph_color.a * params.scene_state.opacity,
-                            ],
-                        });
-                    }
-                    GlyphAtlasKind::Color => {
-                        self.start_or_switch_batch(
-                            &mut active_batch,
-                            PipelineKey::ColorText,
-                            TextureBindingKey::ColorGlyphAtlas(entry.page_id),
-                            params.batch.clip_class,
-                            params.scene_state.clip,
-                            params.batch.effect_class,
-                        );
-                        self.color_text_instances.push(ColorTextInstance {
-                            rect,
-                            uv_rect: [
-                                clipped_uv.x,
-                                clipped_uv.y,
-                                clipped_uv.width,
-                                clipped_uv.height,
-                            ],
-                            alpha: glyph_color.a * params.scene_state.opacity,
-                        });
-                    }
-                }
-            }
-        }
-
-        self.finish_active_batch(
-            &mut active_batch,
-            params.batch.clip_class,
-            params.scene_state.clip,
-            params.batch.effect_class,
-        );
-    }
-}
-
-fn push_gpu_batch(batches: &mut Vec<GpuBatch>, batch: GpuBatch) {
-    let mut builder = GpuBatchBuilder {
-        batches: std::mem::take(batches),
-    };
-    builder.push(batch);
-    *batches = builder.batches;
-}
-
-fn effect_render_policy(effect_policy: BatchEffectPolicy) -> EffectRenderPolicy {
-    match effect_policy {
-        BatchEffectPolicy::None => EffectRenderPolicy::Direct,
-        BatchEffectPolicy::Opacity => EffectRenderPolicy::InlineOpacity,
-    }
-}
-
-fn can_merge_gpu_batches(previous: &GpuBatch, next: &GpuBatch) -> bool {
-    previous.pipeline_key == next.pipeline_key
-        && previous.texture_binding == next.texture_binding
-        && previous.clip_class == next.clip_class
-        && previous.clip_bounds == next.clip_bounds
-        && previous.effect_class == next.effect_class
-        && previous.instance_range.end == next.instance_range.start
-}
-
-fn clip_bounds_to_scissor_rect(
-    clip_bounds: Option<crate::scene::LayoutBox>,
-    scale_factor: f32,
-    viewport_width: u32,
-    viewport_height: u32,
-) -> Option<ScissorRect> {
-    let clip_bounds = clip_bounds?;
-    let scale_factor = scale_factor.max(f32::MIN_POSITIVE);
-    let left = (clip_bounds.x * scale_factor).floor().max(0.0);
-    let top = (clip_bounds.y * scale_factor).floor().max(0.0);
-    let right = ((clip_bounds.x + clip_bounds.width) * scale_factor)
-        .ceil()
-        .min(viewport_width as f32);
-    let bottom = ((clip_bounds.y + clip_bounds.height) * scale_factor)
-        .ceil()
-        .min(viewport_height as f32);
-
-    if right <= left || bottom <= top {
-        return None;
-    }
-
-    Some(ScissorRect {
-        x: left as u32,
-        y: top as u32,
-        width: (right - left) as u32,
-        height: (bottom - top) as u32,
-    })
-}
-
-fn draw_gpu_batch(pass: &mut wgpu::RenderPass<'_>, instance_range: Range<u32>) {
-    pass.draw(0..6, instance_range);
-}
-
-fn draw_gpu_batch_inline_opacity(pass: &mut wgpu::RenderPass<'_>, instance_range: Range<u32>) {
-    pass.draw(0..6, instance_range);
-}
-
-fn stage_write_pod_slice<T: Pod>(
-    staging_belt: &mut StagingBelt,
-    encoder: &mut wgpu::CommandEncoder,
-    target: &Buffer,
-    values: &[T],
-) {
-    if values.is_empty() {
-        return;
-    }
-    stage_write_bytes(staging_belt, encoder, target, bytemuck::cast_slice(values));
-}
-
-fn stage_write_bytes(
-    staging_belt: &mut StagingBelt,
-    encoder: &mut wgpu::CommandEncoder,
-    target: &Buffer,
-    bytes: &[u8],
-) {
-    if bytes.is_empty() {
-        return;
-    }
-
-    let aligned_size = align_copy_size(bytes.len() as u64);
-    let mut view = staging_belt.write_buffer(
-        encoder,
-        target,
-        0,
-        BufferSize::new(aligned_size).expect("aligned size must be non-zero"),
-    );
-    debug_assert_eq!(aligned_size as usize, bytes.len());
-    view.copy_from_slice(bytes);
-}
-
-fn align_copy_size(size: u64) -> u64 {
-    size.next_multiple_of(wgpu::COPY_BUFFER_ALIGNMENT)
-}
-
-fn clip_rect(
-    rect: crate::scene::LayoutBox,
-    clip: Option<crate::scene::LayoutBox>,
-) -> Option<crate::scene::LayoutBox> {
-    clip.map_or(Some(rect), |clip| intersect_rect(rect, clip))
-}
-
-fn clip_text_glyph(
-    rect: crate::scene::LayoutBox,
-    uv: crate::scene::LayoutBox,
-    clip: Option<crate::scene::LayoutBox>,
-) -> Option<(crate::scene::LayoutBox, crate::scene::LayoutBox)> {
-    let clipped = clip_rect(rect, clip)?;
-    if rect.width <= 0.0 || rect.height <= 0.0 {
-        return None;
-    }
-
-    let left_ratio = (clipped.x - rect.x) / rect.width;
-    let top_ratio = (clipped.y - rect.y) / rect.height;
-    let right_ratio = (clipped.x + clipped.width - rect.x) / rect.width;
-    let bottom_ratio = (clipped.y + clipped.height - rect.y) / rect.height;
-
-    let clipped_uv = crate::scene::LayoutBox {
-        x: uv.x + uv.width * left_ratio,
-        y: uv.y + uv.height * top_ratio,
-        width: uv.width * (right_ratio - left_ratio),
-        height: uv.height * (bottom_ratio - top_ratio),
-    };
-
-    Some((clipped, clipped_uv))
-}
-
-fn intersect_clip(
-    a: Option<crate::scene::LayoutBox>,
-    b: Option<crate::scene::LayoutBox>,
-) -> Option<crate::scene::LayoutBox> {
-    match (a, b) {
-        (Some(a), Some(b)) => intersect_rect(a, b),
-        (Some(a), None) => Some(a),
-        (None, Some(b)) => Some(b),
-        (None, None) => None,
-    }
-}
-
-fn intersect_rect(
-    a: crate::scene::LayoutBox,
-    b: crate::scene::LayoutBox,
-) -> Option<crate::scene::LayoutBox> {
-    let left = a.x.max(b.x);
-    let top = a.y.max(b.y);
-    let right = (a.x + a.width).min(b.x + b.width);
-    let bottom = (a.y + a.height).min(b.y + b.height);
-
-    if right <= left || bottom <= top {
-        return None;
-    }
-
-    Some(crate::scene::LayoutBox {
-        x: left,
-        y: top,
-        width: right - left,
-        height: bottom - top,
-    })
-}
-
-fn create_rect_pipeline(
-    device: &Device,
-    view_layout: &BindGroupLayout,
-    surface_format: TextureFormat,
-) -> RenderPipeline {
-    let shader = device.create_shader_module(ShaderModuleDescriptor {
-        label: Some("nekoui_rect_shader"),
-        source: ShaderSource::Wgsl(RECT_SHADER.into()),
-    });
-    let layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
-        label: Some("nekoui_rect_pipeline_layout"),
-        bind_group_layouts: &[Some(view_layout)],
-        immediate_size: 0,
-    });
-    device.create_render_pipeline(&RenderPipelineDescriptor {
-        label: Some("nekoui_rect_pipeline"),
-        layout: Some(&layout),
-        vertex: VertexState {
-            module: &shader,
-            entry_point: Some("vs_main"),
-            compilation_options: PipelineCompilationOptions::default(),
-            buffers: &[VertexBufferLayout {
-                array_stride: std::mem::size_of::<RectInstance>() as u64,
-                step_mode: VertexStepMode::Instance,
-                attributes: &vertex_attr_array![
-                    0 => Float32x4,
-                    1 => Float32x4,
-                    2 => Float32x4,
-                    3 => Float32x4,
-                    4 => Float32x4,
-                    5 => Float32x4,
-                    6 => Float32x4
-                ],
-            }],
-        },
-        fragment: Some(FragmentState {
-            module: &shader,
-            entry_point: Some("fs_main"),
-            compilation_options: PipelineCompilationOptions::default(),
-            targets: &[Some(ColorTargetState {
-                format: surface_format,
-                blend: Some(BlendState::ALPHA_BLENDING),
-                write_mask: ColorWrites::ALL,
-            })],
-        }),
-        primitive: PrimitiveState::default(),
-        depth_stencil: None,
-        multisample: MultisampleState::default(),
-        multiview_mask: None,
-        cache: None,
-    })
-}
-
-fn create_text_texture_bind_group_layout(device: &Device) -> BindGroupLayout {
-    device.create_bind_group_layout(&BindGroupLayoutDescriptor {
-        label: Some("nekoui_text_texture_bind_group_layout"),
-        entries: &[
-            BindGroupLayoutEntry {
-                binding: 0,
-                visibility: ShaderStages::FRAGMENT,
-                ty: BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                count: None,
-            },
-            BindGroupLayoutEntry {
-                binding: 1,
-                visibility: ShaderStages::FRAGMENT,
-                ty: BindingType::Texture {
-                    multisampled: false,
-                    view_dimension: wgpu::TextureViewDimension::D2,
-                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                },
-                count: None,
-            },
-        ],
-    })
-}
-
-fn create_mono_text_pipeline(
-    device: &Device,
-    view_layout: &BindGroupLayout,
-    glyph_layout: &BindGroupLayout,
-    surface_format: TextureFormat,
-) -> RenderPipeline {
-    let shader = device.create_shader_module(ShaderModuleDescriptor {
-        label: Some("nekoui_text_shader"),
-        source: ShaderSource::Wgsl(TEXT_SHADER.into()),
-    });
-    let layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
-        label: Some("nekoui_mono_text_pipeline_layout"),
-        bind_group_layouts: &[Some(view_layout), Some(glyph_layout)],
-        immediate_size: 0,
-    });
-    device.create_render_pipeline(&RenderPipelineDescriptor {
-        label: Some("nekoui_mono_text_pipeline"),
-        layout: Some(&layout),
-        vertex: VertexState {
-            module: &shader,
-            entry_point: Some("vs_mono"),
-            compilation_options: PipelineCompilationOptions::default(),
-            buffers: &[VertexBufferLayout {
-                array_stride: std::mem::size_of::<TextInstance>() as u64,
-                step_mode: VertexStepMode::Instance,
-                attributes: &vertex_attr_array![0 => Float32x4, 1 => Float32x4, 2 => Float32x4],
-            }],
-        },
-        fragment: Some(FragmentState {
-            module: &shader,
-            entry_point: Some("fs_mono"),
-            compilation_options: PipelineCompilationOptions::default(),
-            targets: &[Some(ColorTargetState {
-                format: surface_format,
-                blend: Some(BlendState::ALPHA_BLENDING),
-                write_mask: ColorWrites::ALL,
-            })],
-        }),
-        primitive: PrimitiveState::default(),
-        depth_stencil: None,
-        multisample: MultisampleState::default(),
-        multiview_mask: None,
-        cache: None,
-    })
-}
-
-fn create_color_text_pipeline(
-    device: &Device,
-    view_layout: &BindGroupLayout,
-    glyph_layout: &BindGroupLayout,
-    surface_format: TextureFormat,
-) -> RenderPipeline {
-    let shader = device.create_shader_module(ShaderModuleDescriptor {
-        label: Some("nekoui_text_shader"),
-        source: ShaderSource::Wgsl(TEXT_SHADER.into()),
-    });
-    let layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
-        label: Some("nekoui_color_text_pipeline_layout"),
-        bind_group_layouts: &[Some(view_layout), Some(glyph_layout)],
-        immediate_size: 0,
-    });
-    device.create_render_pipeline(&RenderPipelineDescriptor {
-        label: Some("nekoui_color_text_pipeline"),
-        layout: Some(&layout),
-        vertex: VertexState {
-            module: &shader,
-            entry_point: Some("vs_color"),
-            compilation_options: PipelineCompilationOptions::default(),
-            buffers: &[VertexBufferLayout {
-                array_stride: std::mem::size_of::<ColorTextInstance>() as u64,
-                step_mode: VertexStepMode::Instance,
-                attributes: &vertex_attr_array![0 => Float32x4, 1 => Float32x4, 2 => Float32],
-            }],
-        },
-        fragment: Some(FragmentState {
-            module: &shader,
-            entry_point: Some("fs_color"),
-            compilation_options: PipelineCompilationOptions::default(),
-            targets: &[Some(ColorTargetState {
-                format: surface_format,
-                blend: Some(BlendState::ALPHA_BLENDING),
-                write_mask: ColorWrites::ALL,
-            })],
-        }),
-        primitive: PrimitiveState::default(),
-        depth_stencil: None,
-        multisample: MultisampleState::default(),
-        multiview_mask: None,
-        cache: None,
-    })
-}
-
-fn create_instance_buffer<T: Pod>(device: &Device, label: &str, capacity: usize) -> Buffer {
-    device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some(label),
-        size: (std::mem::size_of::<T>() * capacity.max(1)) as u64,
-        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    })
-}
-
-fn maybe_shrink_instance_buffer<T: Pod>(
-    device: &Device,
-    count: usize,
-    min_capacity: usize,
-    capacity: &mut usize,
-    low_usage_frames: &mut u32,
-    buffer: &mut Buffer,
-    label: &str,
-) {
-    if *capacity <= min_capacity {
-        *low_usage_frames = 0;
-        return;
-    }
-
-    if count.saturating_mul(4) > *capacity {
-        *low_usage_frames = 0;
-        return;
-    }
-
-    *low_usage_frames += 1;
-    if *low_usage_frames < SHRINK_IDLE_FRAME_THRESHOLD {
-        return;
-    }
-
-    let target = count
-        .max(1)
-        .saturating_mul(2)
-        .max(min_capacity)
-        .next_power_of_two();
-    if target >= *capacity {
-        *low_usage_frames = 0;
-        return;
-    }
-
-    *capacity = target;
-    *buffer = create_instance_buffer::<T>(device, label, *capacity);
-    *low_usage_frames = 0;
 }
 
 fn cosmic_to_style_color(color: CosmicColor) -> Color {
@@ -1568,10 +538,12 @@ fn color_to_wgpu(color: Color) -> wgpu::Color {
 
 #[cfg(test)]
 mod tests {
-    use super::{
+    use super::submit::{
+        can_merge_gpu_batches, clip_bounds_to_scissor_rect, effect_render_policy, push_gpu_batch,
+    };
+    use super::types::{
         BatchClipPolicy, BatchEffectPolicy, BatchSubmitState, EffectRenderPolicy, GpuBatch,
-        PipelineKey, ScissorRect, TextureBindingKey, can_merge_gpu_batches,
-        clip_bounds_to_scissor_rect, effect_render_policy, push_gpu_batch,
+        PipelineKey, ScissorRect, TextureBindingKey,
     };
     use crate::scene::{ClipClass, EffectClass, LayoutBox};
 

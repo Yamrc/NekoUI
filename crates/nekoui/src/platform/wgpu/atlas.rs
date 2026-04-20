@@ -28,6 +28,7 @@ pub(crate) struct GlyphAtlas {
     entries: FxHashMap<CacheKey, AtlasEntry>,
     next_page_id: u32,
     frame_id: u64,
+    generation: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -70,6 +71,7 @@ impl GlyphAtlas {
             entries: FxHashMap::default(),
             next_page_id: 0,
             frame_id: 0,
+            generation: 0,
         };
         Ok(atlas)
     }
@@ -81,7 +83,8 @@ impl GlyphAtlas {
         }
     }
 
-    pub(crate) fn bind_group(&self, page_id: u32) -> Option<&BindGroup> {
+    pub(crate) fn bind_group(&mut self, page_id: u32) -> Option<&BindGroup> {
+        self.mark_page_used(page_id);
         self.pages
             .iter()
             .find(|page| page.id == page_id)
@@ -92,6 +95,10 @@ impl GlyphAtlas {
         let entry = self.entries.get(key).copied()?;
         self.mark_page_used(entry.page_id);
         Some(entry)
+    }
+
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
     }
 
     pub(crate) fn upload_mask(
@@ -196,6 +203,7 @@ impl GlyphAtlas {
         self.pages[page_index].used_in_frame = true;
         self.pages[page_index].last_used_frame = self.frame_id;
         self.entries.insert(key, entry);
+        self.generation = self.generation.saturating_add(1);
         Some(entry)
     }
 
@@ -347,6 +355,7 @@ impl GlyphAtlas {
         }
 
         self.pages.retain(|page| !eviction_ids.contains(&page.id));
+        self.generation = self.generation.saturating_add(1);
     }
 
     fn mark_page_used(&mut self, page_id: u32) {
