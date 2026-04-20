@@ -12,7 +12,7 @@ use taffy::style::FlexDirection as TaffyFlexDirection;
 use crate::SharedString;
 use crate::element::{SpecArena, SpecKind, SpecNode, SpecNodeId, SpecPayload};
 use crate::style::{AlignItems, Direction, JustifyContent, Length, Style};
-use crate::text_system::{TextLayout, TextMeasureKey, TextSystem, measure_key};
+use crate::text_system::{SharedTextLayout, TextMeasureKey, TextSystem, measure_key};
 use crate::window::WindowSize;
 
 use super::{
@@ -21,7 +21,7 @@ use super::{
 };
 
 new_key_type! {
-    pub struct NodeId;
+    pub(crate) struct NodeId;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -31,7 +31,7 @@ enum NodeClass {
 }
 
 #[derive(Debug, Clone)]
-pub struct RetainedNode {
+pub(crate) struct RetainedNode {
     pub id: NodeId,
     pub parent: Option<NodeId>,
     pub children: SmallVec<[NodeId; 4]>,
@@ -45,16 +45,16 @@ pub struct RetainedNode {
 }
 
 #[derive(Debug, Clone)]
-pub enum NodeKind {
+pub(crate) enum NodeKind {
     Div,
     Text {
         content: SharedString,
-        layout: Option<TextLayout>,
+        layout: Option<SharedTextLayout>,
     },
 }
 
 #[derive(Debug)]
-pub struct RetainedTree {
+pub(crate) struct RetainedTree {
     root: NodeId,
     nodes: SlotMap<NodeId, RetainedNode>,
     taffy: TaffyTree<MeasureContext>,
@@ -70,7 +70,7 @@ struct TextMeasureContext {
     text: SharedString,
     style: crate::style::TextStyle,
     last_key: Option<TextMeasureKey>,
-    last_layout: Option<TextLayout>,
+    last_layout: Option<SharedTextLayout>,
 }
 
 impl TextMeasureContext {
@@ -120,7 +120,6 @@ impl RetainedTree {
     }
 
     pub fn compute_layout(&mut self, size: WindowSize, text_system: &mut TextSystem) {
-        let mut measured_layouts = rustc_hash::FxHashMap::<TextMeasureKey, TextLayout>::default();
         self.taffy
             .compute_layout_with_measure(
                 self.nodes[self.root].taffy_node,
@@ -146,13 +145,8 @@ impl RetainedTree {
                         .map(|(_, cached_layout)| cached_layout.clone())
                     {
                         cached_layout
-                    } else if let Some(cached_layout) = measured_layouts.get(&key).cloned() {
-                        cached_layout
                     } else {
-                        let measured =
-                            text_system.measure(&text_context.text, &text_context.style, width);
-                        measured_layouts.insert(key.clone(), measured.clone());
-                        measured
+                        text_system.measure(&text_context.text, &text_context.style, width)
                     };
 
                     text_context.last_key = Some(key);
@@ -586,22 +580,17 @@ impl RetainedTree {
             return cached.clone();
         }
 
-        if !subtree_layout_dirty && let Some(cached) = node.compiled_fragment.clone() {
-            let primitives = self.rebuild_subtree_primitives_only(node_id, subtree_scene_dirty);
-            let compiled_fragment = Arc::new(CompiledSubtreeFragment {
-                scene_nodes: cached.scene_nodes.clone(),
-                primitives: Arc::from(primitives),
-                logical_batches: cached.logical_batches.clone(),
-            });
-            self.nodes[node_id].compiled_fragment = Some(compiled_fragment.clone());
-            if node_id == self.root {
-                self.clear_dirty_after_compile();
-            }
-            return compiled_fragment;
-        }
-
         let compiled_fragment =
-            Arc::new(self.rebuild_compiled_subtree_fragment(node_id, subtree_scene_dirty));
+            if !subtree_layout_dirty && let Some(cached) = node.compiled_fragment.clone() {
+                let primitives = self.rebuild_subtree_primitives_only(node_id, subtree_scene_dirty);
+                Arc::new(CompiledSubtreeFragment {
+                    scene_nodes: cached.scene_nodes.clone(),
+                    primitives: Arc::from(primitives),
+                    logical_batches: cached.logical_batches.clone(),
+                })
+            } else {
+                Arc::new(self.rebuild_compiled_subtree_fragment(node_id, subtree_scene_dirty))
+            };
         self.nodes[node_id].compiled_fragment = Some(compiled_fragment.clone());
         if node_id == self.root {
             self.clear_dirty_after_compile();

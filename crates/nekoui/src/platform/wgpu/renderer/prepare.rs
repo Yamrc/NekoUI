@@ -3,7 +3,7 @@ use std::sync::Arc;
 use cosmic_text::{CacheKey, SwashContent};
 
 use crate::platform::wgpu::atlas::{AtlasEntry, GlyphAtlasKind};
-use crate::scene::{CompiledScene, MaterialClass, Primitive, SceneNodeId};
+use crate::scene::{CompiledScene, LogicalBatch, MaterialClass, Primitive, SceneNode, SceneNodeId};
 use crate::text_system::TextSystem;
 
 use super::{
@@ -58,12 +58,10 @@ impl RenderSystem {
         scale_factor: f32,
     ) -> PreparedFrameKey {
         PreparedFrameKey {
-            scene_nodes_ptr: scene.scene_nodes.as_ptr() as usize,
-            scene_nodes_len: scene.scene_nodes.len(),
-            primitives_ptr: scene.primitives.as_ptr() as usize,
-            primitives_len: scene.primitives.len(),
-            logical_batches_ptr: scene.logical_batches.as_ptr() as usize,
-            logical_batches_len: scene.logical_batches.len(),
+            scene_arc_ptr: Arc::as_ptr(&scene.scene_nodes) as *const SceneNode as usize,
+            primitives_arc_ptr: Arc::as_ptr(&scene.primitives) as *const Primitive as usize,
+            logical_batches_arc_ptr: Arc::as_ptr(&scene.logical_batches) as *const LogicalBatch
+                as usize,
             scale_factor_bits: scale_factor.to_bits(),
             mono_atlas_generation: self.mono_atlas.generation(),
             color_atlas_generation: self.color_atlas.generation(),
@@ -285,7 +283,7 @@ impl RenderSystem {
     ) {
         let mut active_batch = None;
 
-        for run in &params.layout.runs {
+        for run in &*params.layout.runs {
             for glyph in &run.glyphs {
                 let physical = glyph.physical(
                     (

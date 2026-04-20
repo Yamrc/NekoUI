@@ -43,12 +43,9 @@ pub(super) struct ColorTextInstance {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct PreparedFrameKey {
-    pub(super) scene_nodes_ptr: usize,
-    pub(super) scene_nodes_len: usize,
-    pub(super) primitives_ptr: usize,
-    pub(super) primitives_len: usize,
-    pub(super) logical_batches_ptr: usize,
-    pub(super) logical_batches_len: usize,
+    pub(super) scene_arc_ptr: usize,
+    pub(super) primitives_arc_ptr: usize,
+    pub(super) logical_batches_arc_ptr: usize,
     pub(super) scale_factor_bits: u32,
     pub(super) mono_atlas_generation: u64,
     pub(super) color_atlas_generation: u64,
@@ -194,7 +191,7 @@ pub(super) struct SceneWalkState {
 
 pub(super) struct TextPrimitiveParams<'a> {
     pub(super) bounds: &'a crate::scene::LayoutBox,
-    pub(super) layout: &'a crate::text_system::TextLayout,
+    pub(super) layout: &'a std::sync::Arc<crate::text_system::TextLayout>,
     pub(super) color: &'a Color,
     pub(super) scene_state: SceneWalkState,
     pub(super) batch: &'a LogicalBatch,
@@ -225,14 +222,14 @@ impl<'a> LogicalBatchCursor<'a> {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub enum RenderOutcome {
+pub(crate) enum RenderOutcome {
     Presented,
     Reconfigure,
     RecreateSurface,
     Unavailable,
 }
 
-pub struct WindowRenderState {
+pub(crate) struct WindowRenderState {
     pub(super) surface: wgpu::Surface<'static>,
     pub(super) config: wgpu::SurfaceConfiguration,
     pub(super) current_size: crate::window::WindowSize,

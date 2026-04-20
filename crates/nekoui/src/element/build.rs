@@ -9,22 +9,22 @@ use crate::window::Window;
 use super::core::{AnyElement, AnyElementKind, Fragment};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct SpecNodeId(usize);
+pub(crate) struct SpecNodeId(usize);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum SpecKind {
+pub(crate) enum SpecKind {
     Div,
     Text,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum SpecPayload {
+pub(crate) enum SpecPayload {
     None,
     Text(SharedString),
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct SpecNode {
+pub(crate) struct SpecNode {
     pub kind: SpecKind,
     pub key: Option<u64>,
     pub style: Style,
@@ -34,19 +34,19 @@ pub struct SpecNode {
 }
 
 #[derive(Debug, Default, Clone)]
-pub struct SpecArena {
+pub(crate) struct SpecArena {
     nodes: Vec<SpecNode>,
 }
 
 #[derive(Debug)]
-pub struct BuildResult {
+pub(crate) struct BuildResult {
     pub root: SpecNodeId,
     pub referenced_views: HashSet<u64>,
 }
 
 type ViewResolver<'a> = dyn FnMut(u64, &mut Window) -> Result<AnyElement, RuntimeError> + 'a;
 
-pub struct BuildCx<'a> {
+pub(crate) struct BuildCx<'a> {
     arena: &'a mut SpecArena,
     window: &'a mut Window,
     view_resolver: &'a mut ViewResolver<'a>,
@@ -54,21 +54,21 @@ pub struct BuildCx<'a> {
 }
 
 impl SpecArena {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::default()
     }
 
-    pub fn reset(&mut self) {
+    pub(crate) fn reset(&mut self) {
         self.nodes.clear();
     }
 
-    pub fn alloc(&mut self, node: SpecNode) -> SpecNodeId {
+    pub(crate) fn alloc(&mut self, node: SpecNode) -> SpecNodeId {
         let id = SpecNodeId(self.nodes.len());
         self.nodes.push(node);
         id
     }
 
-    pub fn node(&self, id: SpecNodeId) -> &SpecNode {
+    pub(crate) fn node(&self, id: SpecNodeId) -> &SpecNode {
         &self.nodes[id.0]
     }
 
@@ -77,7 +77,7 @@ impl SpecArena {
         self.nodes.len()
     }
 
-    pub fn child_ids(&self, id: SpecNodeId) -> SmallVec<[SpecNodeId; 4]> {
+    pub(crate) fn child_ids(&self, id: SpecNodeId) -> SmallVec<[SpecNodeId; 4]> {
         let mut out = SmallVec::new();
         let mut cursor = self.node(id).first_child;
         while let Some(child_id) = cursor {
@@ -89,7 +89,7 @@ impl SpecArena {
 }
 
 impl<'a> BuildCx<'a> {
-    pub fn new(
+    pub(crate) fn new(
         window: &'a mut Window,
         view_resolver: &'a mut ViewResolver<'a>,
         arena: &'a mut SpecArena,
@@ -103,7 +103,7 @@ impl<'a> BuildCx<'a> {
         }
     }
 
-    pub fn build_root(mut self, root: AnyElement) -> Result<BuildResult, RuntimeError> {
+    pub(crate) fn build_root(mut self, root: AnyElement) -> Result<BuildResult, RuntimeError> {
         let root = self.lower_any(root)?;
         Ok(BuildResult {
             root,

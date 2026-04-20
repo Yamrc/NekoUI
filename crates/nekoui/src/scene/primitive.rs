@@ -2,10 +2,10 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use crate::style::{Color, CornerRadii, EdgeWidths, LinearGradient};
-use crate::text_system::TextLayout;
+use crate::text_system::SharedTextLayout;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct LayoutBox {
+pub(crate) struct LayoutBox {
     pub x: f32,
     pub y: f32,
     pub width: f32,
@@ -24,10 +24,10 @@ impl Default for LayoutBox {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct SceneNodeId(pub u32);
+pub(crate) struct SceneNodeId(pub u32);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
-pub struct PrimitiveRange {
+pub(crate) struct PrimitiveRange {
     pub start: u32,
     pub end: u32,
 }
@@ -55,20 +55,20 @@ impl PrimitiveRange {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
-pub struct Transform2D {
+pub(crate) struct Transform2D {
     pub tx: f32,
     pub ty: f32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
-pub struct ClipInfo {
+pub(crate) struct ClipInfo {
     pub bounds: Option<LayoutBox>,
 }
 
-pub type EffectMask = u32;
+pub(crate) type EffectMask = u32;
 
 #[derive(Debug, Clone)]
-pub struct SceneNode {
+pub(crate) struct SceneNode {
     pub parent: Option<SceneNodeId>,
     pub first_child: Option<SceneNodeId>,
     pub next_sibling: Option<SceneNodeId>,
@@ -80,27 +80,27 @@ pub struct SceneNode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum MaterialClass {
+pub(crate) enum MaterialClass {
     Rect,
     Text,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
-pub enum ClipClass {
+pub(crate) enum ClipClass {
     #[default]
     None,
     Rect,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
-pub enum EffectClass {
+pub(crate) enum EffectClass {
     #[default]
     None,
     Opacity,
 }
 
 #[derive(Debug, Clone)]
-pub struct LogicalBatch {
+pub(crate) struct LogicalBatch {
     pub primitive_range: PrimitiveRange,
     pub material_class: MaterialClass,
     pub clip_class: ClipClass,
@@ -108,7 +108,7 @@ pub struct LogicalBatch {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
-pub enum EffectRegionKind {
+pub(crate) enum EffectRegionKind {
     #[default]
     None,
 }
@@ -118,7 +118,7 @@ pub enum EffectRegionKind {
     reason = "Effect region metadata is reserved for later scene/render integration"
 )]
 #[derive(Debug, Clone)]
-pub struct EffectRegion {
+pub(crate) struct EffectRegion {
     pub bounds: LayoutBox,
     pub kind: EffectRegionKind,
 }
@@ -128,7 +128,7 @@ pub struct EffectRegion {
     reason = "Compiled scene carries forward-looking metadata for upcoming passes"
 )]
 #[derive(Debug, Clone)]
-pub struct CompiledScene {
+pub(crate) struct CompiledScene {
     pub clear_color: Option<Color>,
     pub scene_nodes: Arc<[SceneNode]>,
     pub primitives: Arc<[Primitive]>,
@@ -137,13 +137,13 @@ pub struct CompiledScene {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub enum RectFill {
+pub(crate) enum RectFill {
     Solid(Color),
     LinearGradient(LinearGradient),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct RectPrimitive {
+pub(crate) struct RectPrimitive {
     pub bounds: LayoutBox,
     pub fill: RectFill,
     pub corner_radii: CornerRadii,
@@ -153,11 +153,11 @@ pub struct RectPrimitive {
 }
 
 #[derive(Debug, Clone)]
-pub enum Primitive {
+pub(crate) enum Primitive {
     Rect(RectPrimitive),
     Text {
         bounds: LayoutBox,
-        layout: TextLayout,
+        layout: SharedTextLayout,
         color: Color,
     },
 }

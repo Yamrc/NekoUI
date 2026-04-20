@@ -21,7 +21,7 @@ pub struct Fragment {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct ViewSpec {
+pub(crate) struct ViewSpec {
     pub(crate) entity_id: u64,
 }
 

@@ -1,7 +1,9 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::sync::Arc;
 
 use cosmic_text::{Attrs, Buffer, Family, FontSystem, LayoutGlyph, Metrics, Shaping};
+use rustc_hash::FxHashMap;
 
 use crate::SharedString;
 use crate::style::TextStyle;
@@ -19,6 +21,8 @@ pub struct TextRun {
     pub glyphs: Vec<LayoutGlyph>,
 }
 
+pub type SharedTextLayout = Arc<TextLayout>;
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TextMeasureKey {
     pub text_hash: u64,
@@ -29,16 +33,57 @@ pub struct TextMeasureKey {
 #[derive(Debug)]
 pub struct TextSystem {
     font_system: FontSystem,
+    measure_cache: FxHashMap<TextMeasureKey, SharedTextLayout>,
+    cache_stats: TextCacheStats,
+}
+
+#[derive(Debug, Default)]
+pub struct TextCacheStats {
+    pub hits: u64,
+    pub misses: u64,
+}
+
+impl TextCacheStats {
+    pub fn hit_rate(&self) -> f64 {
+        let total = self.hits + self.misses;
+        if total == 0 {
+            0.0
+        } else {
+            self.hits as f64 / total as f64
+        }
+    }
 }
 
 impl TextSystem {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             font_system: FontSystem::new(),
+            measure_cache: FxHashMap::default(),
+            cache_stats: TextCacheStats::default(),
         }
     }
 
-    pub fn measure(
+    pub(crate) fn measure(
+        &mut self,
+        text: &SharedString,
+        style: &TextStyle,
+        width: Option<f32>,
+    ) -> SharedTextLayout {
+        let key = measure_key(text, style, width);
+
+        if let Some(cached) = self.measure_cache.get(&key) {
+            self.cache_stats.hits += 1;
+            return cached.clone();
+        }
+
+        self.cache_stats.misses += 1;
+        let layout = self.shape_and_layout(text, style, width);
+        let shared = Arc::new(layout);
+        self.measure_cache.insert(key, shared.clone());
+        shared
+    }
+
+    fn shape_and_layout(
         &mut self,
         text: &SharedString,
         style: &TextStyle,
@@ -79,6 +124,17 @@ impl TextSystem {
         }
     }
 
+    #[allow(dead_code)]
+    pub(crate) fn cache_stats(&self) -> &TextCacheStats {
+        &self.cache_stats
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn clear_cache(&mut self) {
+        self.measure_cache.clear();
+        self.cache_stats = TextCacheStats::default();
+    }
+
     pub(crate) fn font_system_mut(&mut self) -> &mut FontSystem {
         &mut self.font_system
     }
@@ -90,7 +146,11 @@ impl Default for TextSystem {
     }
 }
 
-pub fn measure_key(text: &SharedString, style: &TextStyle, width: Option<f32>) -> TextMeasureKey {
+pub(crate) fn measure_key(
+    text: &SharedString,
+    style: &TextStyle,
+    width: Option<f32>,
+) -> TextMeasureKey {
     TextMeasureKey {
         text_hash: hash_value(text.as_ref()),
         style_hash: hash_text_style(style),
