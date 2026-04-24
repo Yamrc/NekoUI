@@ -1,9 +1,13 @@
 use std::sync::Arc;
+#[cfg(target_os = "macos")]
+use std::time::Instant;
 
 use hashbrown::HashSet;
-use winit::dpi::PhysicalSize;
+use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::window::Window as WinitWindow;
 
+#[cfg(target_os = "linux")]
+use crate::platform::window::native::linux::LinuxWindowRoute;
 use crate::scene::RetainedTree;
 use crate::window::{Window, WindowSize};
 
@@ -22,6 +26,11 @@ pub(crate) struct RuntimeWindow {
     pub(crate) presentation_pending: bool,
     pub(crate) metrics_scene_sync_pending: bool,
     pub(crate) occluded: bool,
+    pub(crate) cursor_position: Option<PhysicalPosition<f64>>,
+    #[cfg(target_os = "linux")]
+    pub(crate) linux_route: LinuxWindowRoute,
+    #[cfg(target_os = "macos")]
+    pub(crate) last_drag_click: Option<(Instant, PhysicalPosition<f64>)>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -62,7 +71,7 @@ pub(crate) fn window_metrics_changed(
     runtime_window: &RuntimeWindow,
     metrics: WindowMetrics,
 ) -> bool {
-    runtime_window.public_window.size() != metrics.logical_size
+    runtime_window.public_window.content_size() != metrics.logical_size
         || runtime_window.public_window.physical_size() != metrics.physical_size
         || (runtime_window.public_window.scale_factor() - metrics.scale_factor).abs() > f64::EPSILON
 }

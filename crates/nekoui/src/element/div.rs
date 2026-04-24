@@ -1,14 +1,15 @@
 use crate::style::{
     AlignItems, BackgroundFill, Color, CornerRadii, Direction, EdgeInsets, EdgeWidths,
-    JustifyContent, Length, Size, Style,
+    JustifyContent, LayoutSize, Length, Style,
 };
 
-use super::{AnyElement, Fragment, IntoElement, IntoElements, ParentElement};
+use super::{AnyElement, Fragment, IntoElement, IntoElements, ParentElement, WindowFrameArea};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Div {
     pub(crate) key: Option<u64>,
     pub(crate) style: Style,
+    pub(crate) window_frame_area: Option<WindowFrameArea>,
     pub(crate) children: Fragment,
 }
 
@@ -16,6 +17,7 @@ pub fn div() -> Div {
     Div {
         key: None,
         style: Style::default(),
+        window_frame_area: None,
         children: Fragment::new(),
     }
 }
@@ -32,18 +34,18 @@ impl Div {
         self
     }
 
-    pub fn size(mut self, size: Size) -> Self {
+    pub fn size(mut self, size: LayoutSize) -> Self {
         self.style.layout.size = size;
         self
     }
 
-    pub fn width(mut self, width: Length) -> Self {
-        self.style.layout.size.width = width;
+    pub fn width(mut self, width: impl Into<Length>) -> Self {
+        self.style.layout.size.width = width.into();
         self
     }
 
-    pub fn height(mut self, height: Length) -> Self {
-        self.style.layout.size.height = height;
+    pub fn height(mut self, height: impl Into<Length>) -> Self {
+        self.style.layout.size.height = height.into();
         self
     }
 
@@ -125,6 +127,26 @@ impl Div {
 
     pub fn clip(mut self) -> Self {
         self.style.paint.clip_children = true;
+        self
+    }
+
+    pub fn window_drag_area(mut self) -> Self {
+        self.window_frame_area = Some(WindowFrameArea::Drag);
+        self
+    }
+
+    pub fn window_close_button(mut self) -> Self {
+        self.window_frame_area = Some(WindowFrameArea::Close);
+        self
+    }
+
+    pub fn window_maximize_button(mut self) -> Self {
+        self.window_frame_area = Some(WindowFrameArea::Maximize);
+        self
+    }
+
+    pub fn window_minimize_button(mut self) -> Self {
+        self.window_frame_area = Some(WindowFrameArea::Minimize);
         self
     }
 }

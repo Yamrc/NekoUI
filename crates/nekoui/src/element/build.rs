@@ -4,9 +4,9 @@ use smallvec::SmallVec;
 use crate::SharedString;
 use crate::error::RuntimeError;
 use crate::style::Style;
-use crate::window::Window;
+use crate::window::WindowInfo;
 
-use super::core::{AnyElement, AnyElementKind, Fragment};
+use super::core::{AnyElement, AnyElementKind, Fragment, WindowFrameArea};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct SpecNodeId(usize);
@@ -28,6 +28,7 @@ pub(crate) struct SpecNode {
     pub kind: SpecKind,
     pub key: Option<u64>,
     pub style: Style,
+    pub window_frame_area: Option<WindowFrameArea>,
     pub payload: SpecPayload,
     pub first_child: Option<SpecNodeId>,
     pub next_sibling: Option<SpecNodeId>,
@@ -44,11 +45,11 @@ pub(crate) struct BuildResult {
     pub referenced_views: HashSet<u64>,
 }
 
-type ViewResolver<'a> = dyn FnMut(u64, &mut Window) -> Result<AnyElement, RuntimeError> + 'a;
+type ViewResolver<'a> = dyn FnMut(u64, &WindowInfo) -> Result<AnyElement, RuntimeError> + 'a;
 
 pub(crate) struct BuildCx<'a> {
     arena: &'a mut SpecArena,
-    window: &'a mut Window,
+    window: &'a WindowInfo,
     view_resolver: &'a mut ViewResolver<'a>,
     referenced_views: HashSet<u64>,
 }
@@ -90,7 +91,7 @@ impl SpecArena {
 
 impl<'a> BuildCx<'a> {
     pub(crate) fn new(
-        window: &'a mut Window,
+        window: &'a WindowInfo,
         view_resolver: &'a mut ViewResolver<'a>,
         arena: &'a mut SpecArena,
     ) -> Self {
@@ -130,6 +131,7 @@ impl<'a> BuildCx<'a> {
             kind: SpecKind::Div,
             key: div.key,
             style: div.style.clone(),
+            window_frame_area: div.window_frame_area,
             payload: SpecPayload::None,
             first_child,
             next_sibling: None,
@@ -141,6 +143,7 @@ impl<'a> BuildCx<'a> {
             kind: SpecKind::Text,
             key: text.key,
             style: text.style.clone(),
+            window_frame_area: text.window_frame_area,
             payload: SpecPayload::Text(text.content.clone()),
             first_child: None,
             next_sibling: None,

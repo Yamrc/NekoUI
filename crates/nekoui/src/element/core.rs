@@ -25,6 +25,14 @@ pub(crate) struct ViewSpec {
     pub(crate) entity_id: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum WindowFrameArea {
+    Drag,
+    Close,
+    Maximize,
+    Minimize,
+}
+
 pub trait IntoElement: Sized {
     fn into_any_element(self) -> AnyElement;
 }
@@ -187,12 +195,6 @@ where
         fragment.push(self.1.into_any_element());
         fragment.push(self.2.into_any_element());
         fragment.push(self.3.into_any_element());
-    }
-}
-
-impl IntoElement for () {
-    fn into_any_element(self) -> AnyElement {
-        super::div().into_any_element()
     }
 }
 

@@ -5,7 +5,7 @@ default-members = ["crates/nekoui"]
 
 [workspace.package]
 publish = false
-version = "0.0.5"
+version = "0.0.6"
 edition = "2024"
 authors = ["Yamrc <yamrci@outlook.com>"]
 license = "MPL-2.0"
@@ -20,6 +20,9 @@ cosmic-text = { version = "0.18.2", default-features = false, features = ["std",
 etagere = "0.2.15"
 hashbrown = { version = "0.15.2", default-features = false, features = ["default-hasher", "inline-more"] }
 log = "0.4.29"
+objc2 = "0.5.2"
+objc2-app-kit = { version = "0.2.2", features = ["NSButton", "NSResponder", "NSView", "NSWindow"] }
+objc2-foundation = { version = "0.2.2", features = ["NSDictionary", "NSGeometry", "NSString", "NSUserDefaults"] }
 parking_lot = "0.12.5"
 pollster = { version = "0.4.0" }
 ropey = { version = "1.6.1", default-features = false, features = ["simd", "unicode_lines"] }
@@ -32,6 +35,7 @@ thiserror = "2.0.18"
 unicode-segmentation = "1.12.0"
 wgpu = { version = "29.0.1", default-features = false, features = ["std", "parking_lot", "vulkan", "metal", "wgsl"] }
 winit = { version = "0.30.13", default-features = false, features = ["rwh_06", "x11", "wayland", "wayland-dlopen"] }
+windows-sys = { version = "0.61.2", features = [ "Win32_Foundation", "Win32_Graphics_Gdi", "Win32_UI_HiDpi", "Win32_UI_WindowsAndMessaging", ] }
 
 [profile.dev]
 split-debuginfo = "unpacked"

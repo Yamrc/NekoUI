@@ -6,6 +6,7 @@ mod text;
 pub(crate) use build::{
     BuildCx, BuildResult, SpecArena, SpecKind, SpecNode, SpecNodeId, SpecPayload,
 };
+pub(crate) use core::WindowFrameArea;
 pub use core::{AnyElement, Fragment, IntoElement, IntoElements, ParentElement};
 pub use div::{Div, div};
 pub use text::{Text, text};

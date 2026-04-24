@@ -1,3 +1,5 @@
+use crate::geometry::Px;
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Color {
     pub r: f32,
@@ -56,23 +58,36 @@ pub fn gradient(start_color: Color, end_color: Color, angle_radians: f32) -> Bac
 pub enum Length {
     #[default]
     Auto,
-    Px(f32),
+    Px(Px),
     Fill,
 }
 
+impl From<Px> for Length {
+    fn from(value: Px) -> Self {
+        Self::Px(value)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Size {
+pub struct LayoutSize {
     pub width: Length,
     pub height: Length,
 }
 
-impl Size {
+impl LayoutSize {
     pub const fn new(width: Length, height: Length) -> Self {
         Self { width, height }
     }
+
+    pub const fn fill() -> Self {
+        Self {
+            width: Length::Fill,
+            height: Length::Fill,
+        }
+    }
 }
 
-impl Default for Size {
+impl Default for LayoutSize {
     fn default() -> Self {
         Self::new(Length::Auto, Length::Auto)
     }
@@ -168,7 +183,7 @@ pub enum AlignItems {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct LayoutStyle {
-    pub size: Size,
+    pub size: LayoutSize,
     pub padding: EdgeInsets,
     pub margin: EdgeInsets,
     pub direction: Direction,
@@ -180,7 +195,7 @@ pub struct LayoutStyle {
 impl Default for LayoutStyle {
     fn default() -> Self {
         Self {
-            size: Size::default(),
+            size: LayoutSize::default(),
             padding: EdgeInsets::default(),
             margin: EdgeInsets::default(),
             direction: Direction::default(),

@@ -10,7 +10,7 @@ use taffy::prelude::{
 use taffy::style::FlexDirection as TaffyFlexDirection;
 
 use crate::SharedString;
-use crate::element::{SpecArena, SpecKind, SpecNode, SpecNodeId, SpecPayload};
+use crate::element::{SpecArena, SpecKind, SpecNode, SpecNodeId, SpecPayload, WindowFrameArea};
 use crate::style::{AlignItems, Direction, JustifyContent, Length, Style};
 use crate::text_system::{SharedTextLayout, TextMeasureKey, TextSystem, measure_key};
 use crate::window::WindowSize;
@@ -38,6 +38,7 @@ pub(crate) struct RetainedNode {
     pub kind: NodeKind,
     pub key: Option<u64>,
     pub style: Style,
+    pub window_frame_area: Option<WindowFrameArea>,
     pub layout: LayoutBox,
     pub dirty: DirtyLaneMask,
     compiled_fragment: Option<Arc<CompiledSubtreeFragment>>,
@@ -232,6 +233,19 @@ impl RetainedTree {
         }
     }
 
+    pub fn window_frame_area_at(
+        &self,
+        point: crate::geometry::Point<crate::geometry::Px>,
+    ) -> Option<WindowFrameArea> {
+        self.window_frame_area_at_node(self.root, point, [0.0, 0.0])
+    }
+
+    pub fn collect_window_frame_areas(&self) -> Vec<(WindowFrameArea, LayoutBox)> {
+        let mut areas = Vec::new();
+        self.collect_window_frame_areas_from(self.root, [0.0, 0.0], &mut areas);
+        areas
+    }
+
     fn clear_dirty_marks(&mut self) {
         for (_, node) in &mut self.nodes {
             node.dirty = DirtyLaneMask::empty();
@@ -268,6 +282,7 @@ impl RetainedTree {
                 .expect("div style patch must succeed");
         }
         self.nodes[node_id].key = spec.key;
+        self.nodes[node_id].window_frame_area = spec.window_frame_area;
 
         let child_dirty = self.sync_children(node_id, arena, arena.child_ids(spec_id).as_slice());
         dirty |= child_dirty;
@@ -313,6 +328,7 @@ impl RetainedTree {
             }
         }
         self.nodes[node_id].key = spec.key;
+        self.nodes[node_id].window_frame_area = spec.window_frame_area;
 
         if !dirty.is_empty() {
             self.taffy
@@ -501,6 +517,7 @@ impl RetainedTree {
             kind: NodeKind::Div,
             key: spec.key,
             style: spec.style.clone(),
+            window_frame_area: spec.window_frame_area,
             layout: LayoutBox::default(),
             dirty: DirtyLaneMask::BUILD.normalized(),
             compiled_fragment: None,
@@ -543,6 +560,7 @@ impl RetainedTree {
             },
             key: spec.key,
             style: spec.style.clone(),
+            window_frame_area: spec.window_frame_area,
             layout: LayoutBox::default(),
             dirty: DirtyLaneMask::BUILD.normalized(),
             compiled_fragment: None,
@@ -561,6 +579,58 @@ impl RetainedTree {
             .remove(taffy_node)
             .expect("retained subtree removal must succeed");
         self.nodes.remove(node_id);
+    }
+
+    fn window_frame_area_at_node(
+        &self,
+        node_id: NodeId,
+        point: crate::geometry::Point<crate::geometry::Px>,
+        offset: [f32; 2],
+    ) -> Option<WindowFrameArea> {
+        let node = &self.nodes[node_id];
+        let absolute = LayoutBox {
+            x: offset[0] + node.layout.x,
+            y: offset[1] + node.layout.y,
+            width: node.layout.width,
+            height: node.layout.height,
+        };
+
+        if !layout_box_contains_point(absolute, point) {
+            return None;
+        }
+
+        let child_offset = [absolute.x, absolute.y];
+        for child_id in node.children.iter().rev().copied() {
+            if let Some(area) = self.window_frame_area_at_node(child_id, point, child_offset) {
+                return Some(area);
+            }
+        }
+
+        node.window_frame_area
+    }
+
+    fn collect_window_frame_areas_from(
+        &self,
+        node_id: NodeId,
+        offset: [f32; 2],
+        out: &mut Vec<(WindowFrameArea, LayoutBox)>,
+    ) {
+        let node = &self.nodes[node_id];
+        let absolute = LayoutBox {
+            x: offset[0] + node.layout.x,
+            y: offset[1] + node.layout.y,
+            width: node.layout.width,
+            height: node.layout.height,
+        };
+
+        if let Some(area) = node.window_frame_area {
+            out.push((area, absolute));
+        }
+
+        let child_offset = [absolute.x, absolute.y];
+        for child_id in node.children.iter().copied() {
+            self.collect_window_frame_areas_from(child_id, child_offset, out);
+        }
     }
 
     fn get_or_build_subtree_fragment(
@@ -929,7 +999,7 @@ fn text_style_to_taffy(style: &Style) -> TaffyStyle {
 fn length_to_dimension(length: Length) -> Dimension {
     match length {
         Length::Auto => Dimension::AUTO,
-        Length::Px(value) => Dimension::length(value),
+        Length::Px(value) => Dimension::length(value.get()),
         Length::Fill => Dimension::percent(1.0),
     }
 }
@@ -940,6 +1010,15 @@ fn edge_to_length(value: f32) -> LengthPercentage {
 
 fn edge_to_auto(value: f32) -> LengthPercentageAuto {
     LengthPercentageAuto::length(value)
+}
+
+fn layout_box_contains_point(
+    layout: LayoutBox,
+    point: crate::geometry::Point<crate::geometry::Px>,
+) -> bool {
+    let x = point.x.get();
+    let y = point.y.get();
+    x >= layout.x && x <= layout.x + layout.width && y >= layout.y && y <= layout.y + layout.height
 }
 
 fn build_logical_batches(scene_nodes: &[SceneNode], primitives: &[Primitive]) -> Vec<LogicalBatch> {
@@ -1057,28 +1136,39 @@ mod tests {
 
     use crate::app::{App, Render};
     use crate::element::{BuildCx, IntoElement, ParentElement, SpecArena};
+    use crate::geometry::px;
+    use crate::platform::window::WindowInfoSeed;
     use crate::scene::{Primitive, RectFill};
-    use crate::style::{Color, CornerRadii, EdgeInsets, EdgeWidths, Length, gradient};
+    use crate::style::{Color, CornerRadii, EdgeInsets, EdgeWidths, gradient};
     use crate::text_system::TextSystem;
-    use crate::window::{Window, WindowId, WindowSize};
+    use crate::window::{Window, WindowId, WindowInfo, WindowOptions, WindowSize};
 
     use super::{ClipClass, DirtyLaneMask, EffectClass, NodeKind, RetainedTree};
 
-    fn build_static_tree(root: crate::AnyElement) -> RetainedTree {
-        let mut window = Window::new_with_metrics(
+    fn test_window(logical: WindowSize, physical: WindowSize, scale_factor: f64) -> Window {
+        Window::from_options(
             WindowId::new(),
-            String::from("test"),
-            WindowSize::new(320, 200),
-            WindowSize::new(320, 200),
-            1.0,
-        );
+            &WindowOptions::default(),
+            WindowInfoSeed {
+                content_size: logical,
+                frame_size: Some(logical),
+                physical_size: physical,
+                scale_factor,
+                position: None,
+                current_display: None,
+            },
+        )
+    }
+
+    fn build_static_tree(root: crate::AnyElement) -> RetainedTree {
+        let window = test_window(WindowSize::new(320, 200), WindowSize::new(320, 200), 1.0);
         let mut resolver = |_view_id: u64,
-                            _window: &mut Window|
+                            _window: &WindowInfo|
          -> Result<crate::AnyElement, crate::RuntimeError> {
             unreachable!("static test tree should not resolve nested views")
         };
         let mut arena = SpecArena::new();
-        let built = BuildCx::new(&mut window, &mut resolver, &mut arena)
+        let built = BuildCx::new(&window, &mut resolver, &mut arena)
             .build_root(root)
             .unwrap();
         RetainedTree::from_spec(&arena, built.root)
@@ -1087,7 +1177,7 @@ mod tests {
     #[test]
     fn text_measurement_wraps_within_available_width() {
         let root = crate::div()
-            .width(Length::Px(200.0))
+            .width(px(200.0))
             .padding(EdgeInsets::all(10.0))
             .child(crate::text("hello neko ui hello neko ui hello neko ui").font_size(16.0))
             .into_any_element();
@@ -1119,20 +1209,14 @@ mod tests {
         let updated = crate::div().child(crate::text("hello").color(Color::rgb(0x222222)));
 
         let mut tree = build_static_tree(root.into_any_element());
-        let mut window = Window::new_with_metrics(
-            WindowId::new(),
-            String::from("test"),
-            WindowSize::new(320, 200),
-            WindowSize::new(320, 200),
-            1.0,
-        );
+        let window = test_window(WindowSize::new(320, 200), WindowSize::new(320, 200), 1.0);
         let mut resolver = |_view_id: u64,
-                            _window: &mut Window|
+                            _window: &WindowInfo|
          -> Result<crate::AnyElement, crate::RuntimeError> {
             unreachable!("static test tree should not resolve nested views")
         };
         let mut arena = SpecArena::new();
-        let built = BuildCx::new(&mut window, &mut resolver, &mut arena)
+        let built = BuildCx::new(&window, &mut resolver, &mut arena)
             .build_root(updated.into_any_element())
             .unwrap();
         let dirty = tree.update_from_spec(&arena, built.root);
@@ -1141,24 +1225,18 @@ mod tests {
 
     #[test]
     fn diff_marks_layout_for_div_size_change() {
-        let root = crate::div().width(Length::Px(100.0));
-        let updated = crate::div().width(Length::Px(140.0));
+        let root = crate::div().width(px(100.0));
+        let updated = crate::div().width(px(140.0));
 
         let mut tree = build_static_tree(root.into_any_element());
-        let mut window = Window::new_with_metrics(
-            WindowId::new(),
-            String::from("test"),
-            WindowSize::new(320, 200),
-            WindowSize::new(320, 200),
-            1.0,
-        );
+        let window = test_window(WindowSize::new(320, 200), WindowSize::new(320, 200), 1.0);
         let mut resolver = |_view_id: u64,
-                            _window: &mut Window|
+                            _window: &WindowInfo|
          -> Result<crate::AnyElement, crate::RuntimeError> {
             unreachable!("static test tree should not resolve nested views")
         };
         let mut arena = SpecArena::new();
-        let built = BuildCx::new(&mut window, &mut resolver, &mut arena)
+        let built = BuildCx::new(&window, &mut resolver, &mut arena)
             .build_root(updated.into_any_element())
             .unwrap();
         let dirty = tree.update_from_spec(&arena, built.root);
@@ -1171,20 +1249,14 @@ mod tests {
         let updated = crate::div().child(crate::text("a")).child(crate::text("b"));
 
         let mut tree = build_static_tree(root.into_any_element());
-        let mut window = Window::new_with_metrics(
-            WindowId::new(),
-            String::from("test"),
-            WindowSize::new(320, 200),
-            WindowSize::new(320, 200),
-            1.0,
-        );
+        let window = test_window(WindowSize::new(320, 200), WindowSize::new(320, 200), 1.0);
         let mut resolver = |_view_id: u64,
-                            _window: &mut Window|
+                            _window: &WindowInfo|
          -> Result<crate::AnyElement, crate::RuntimeError> {
             unreachable!("static test tree should not resolve nested views")
         };
         let mut arena = SpecArena::new();
-        let built = BuildCx::new(&mut window, &mut resolver, &mut arena)
+        let built = BuildCx::new(&window, &mut resolver, &mut arena)
             .build_root(updated.into_any_element())
             .unwrap();
         let dirty = tree.update_from_spec(&arena, built.root);
@@ -1204,20 +1276,14 @@ mod tests {
         let first = tree.children(tree.root_id())[0];
         let second = tree.children(tree.root_id())[1];
 
-        let mut window = Window::new_with_metrics(
-            WindowId::new(),
-            String::from("test"),
-            WindowSize::new(320, 200),
-            WindowSize::new(320, 200),
-            1.0,
-        );
+        let window = test_window(WindowSize::new(320, 200), WindowSize::new(320, 200), 1.0);
         let mut resolver = |_view_id: u64,
-                            _window: &mut Window|
+                            _window: &WindowInfo|
          -> Result<crate::AnyElement, crate::RuntimeError> {
             unreachable!("static test tree should not resolve nested views")
         };
         let mut arena = SpecArena::new();
-        let built = BuildCx::new(&mut window, &mut resolver, &mut arena)
+        let built = BuildCx::new(&window, &mut resolver, &mut arena)
             .build_root(updated.into_any_element())
             .unwrap();
         let dirty = tree.update_from_spec(&arena, built.root);
@@ -1282,20 +1348,14 @@ mod tests {
         tree.compute_layout(WindowSize::new(320, 200), &mut text_system);
         let original = tree.compile_scene();
 
-        let mut window = Window::new_with_metrics(
-            WindowId::new(),
-            String::from("test"),
-            WindowSize::new(320, 200),
-            WindowSize::new(320, 200),
-            1.0,
-        );
+        let window = test_window(WindowSize::new(320, 200), WindowSize::new(320, 200), 1.0);
         let mut resolver = |_view_id: u64,
-                            _window: &mut Window|
+                            _window: &WindowInfo|
          -> Result<crate::AnyElement, crate::RuntimeError> {
             unreachable!("static test tree should not resolve nested views")
         };
         let mut arena = SpecArena::new();
-        let built = BuildCx::new(&mut window, &mut resolver, &mut arena)
+        let built = BuildCx::new(&window, &mut resolver, &mut arena)
             .build_root(updated)
             .unwrap();
         let dirty = tree.update_from_spec(&arena, built.root);
@@ -1329,20 +1389,14 @@ mod tests {
         tree.compute_layout(WindowSize::new(320, 200), &mut text_system);
         let original = tree.compile_scene();
 
-        let mut window = Window::new_with_metrics(
-            WindowId::new(),
-            String::from("test"),
-            WindowSize::new(320, 200),
-            WindowSize::new(320, 200),
-            1.0,
-        );
+        let window = test_window(WindowSize::new(320, 200), WindowSize::new(320, 200), 1.0);
         let mut resolver = |_view_id: u64,
-                            _window: &mut Window|
+                            _window: &WindowInfo|
          -> Result<crate::AnyElement, crate::RuntimeError> {
             unreachable!("static test tree should not resolve nested views")
         };
         let mut arena = SpecArena::new();
-        let built = BuildCx::new(&mut window, &mut resolver, &mut arena)
+        let built = BuildCx::new(&window, &mut resolver, &mut arena)
             .build_root(updated)
             .unwrap();
         let dirty = tree.update_from_spec(&arena, built.root);
@@ -1491,20 +1545,14 @@ mod tests {
             .clone()
             .expect("clean sibling fragment cached after compile");
 
-        let mut window = Window::new_with_metrics(
-            WindowId::new(),
-            String::from("test"),
-            WindowSize::new(320, 200),
-            WindowSize::new(320, 200),
-            1.0,
-        );
+        let window = test_window(WindowSize::new(320, 200), WindowSize::new(320, 200), 1.0);
         let mut resolver = |_view_id: u64,
-                            _window: &mut Window|
+                            _window: &WindowInfo|
          -> Result<crate::AnyElement, crate::RuntimeError> {
             unreachable!("static test tree should not resolve nested views")
         };
         let mut arena = SpecArena::new();
-        let built = BuildCx::new(&mut window, &mut resolver, &mut arena)
+        let built = BuildCx::new(&window, &mut resolver, &mut arena)
             .build_root(updated)
             .unwrap();
         let dirty = tree.update_from_spec(&arena, built.root);
@@ -1525,28 +1573,22 @@ mod tests {
         impl Render for LabelView {
             fn render(
                 &mut self,
-                _window: &mut Window,
+                _window: &WindowInfo,
                 _cx: &mut crate::Context<'_, Self>,
             ) -> impl IntoElement {
                 crate::text("resolved from view")
             }
         }
 
-        let app = App::new();
+        let app = App::new(Vec::new());
         let view = app.insert_view(LabelView);
-        let mut window = Window::new_with_metrics(
-            WindowId::new(),
-            String::from("test"),
-            WindowSize::new(320, 200),
-            WindowSize::new(640, 400),
-            2.0,
-        );
+        let window = test_window(WindowSize::new(320, 200), WindowSize::new(640, 400), 2.0);
         let root = crate::div().child(view).into_any_element();
         let mut arena = SpecArena::new();
-        let built = app.build_root_spec(&mut window, &root, &mut arena).unwrap();
+        let built = app.build_root_spec(&window, &root, &mut arena).unwrap();
         let mut tree = RetainedTree::from_spec(&arena, built.root);
         let mut text_system = TextSystem::new();
-        tree.compute_layout(window.size(), &mut text_system);
+        tree.compute_layout(window.content_size(), &mut text_system);
 
         let child = tree.children(tree.root_id())[0];
         assert!(matches!(tree.node(child).kind, NodeKind::Text { .. }));

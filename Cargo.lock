@@ -993,7 +993,7 @@ dependencies = [
 
 [[package]]
 name = "nekoui"
-version = "0.0.5"
+version = "0.0.6"
 dependencies = [
  "bitflags 2.11.1",
  "bytemuck",
@@ -1003,6 +1003,9 @@ dependencies = [
  "etagere",
  "hashbrown 0.15.5",
  "log",
+ "objc2 0.5.2",
+ "objc2-app-kit",
+ "objc2-foundation 0.2.2",
  "parking_lot",
  "pollster",
  "rustc-hash 2.1.2",
@@ -1012,6 +1015,7 @@ dependencies = [
  "taffy",
  "thiserror 2.0.18",
  "wgpu",
+ "windows-sys 0.61.2",
  "winit",
 ]
 
