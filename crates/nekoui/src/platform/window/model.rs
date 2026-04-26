@@ -5,7 +5,7 @@ use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::monitor::MonitorHandle;
 
 use crate::SharedString;
-use crate::geometry::{Bounds, Point, Px, Size, bounds, point, px, size};
+use crate::style::{Bounds, Point, Px, Size, bounds, point, px, size};
 
 use super::handle::WindowId;
 
@@ -423,7 +423,7 @@ fn sanitize_scale_factor(scale_factor: f64) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use crate::geometry::{point, px, size};
+    use crate::style::{point, px, size};
 
     use super::{
         DisplaySelector, WindowBehavior, WindowGeometry, WindowOptions, WindowPlacement,

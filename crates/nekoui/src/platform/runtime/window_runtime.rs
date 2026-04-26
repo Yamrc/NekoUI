@@ -24,13 +24,47 @@ pub(crate) struct RuntimeWindow {
     pub(crate) compiled_scene: crate::scene::CompiledScene,
     pub(crate) render_state: WindowRenderState,
     pub(crate) presentation_pending: bool,
-    pub(crate) metrics_scene_sync_pending: bool,
+    pub(crate) redraw_requested: bool,
+    pub(crate) generation_state: WindowGenerationState,
     pub(crate) occluded: bool,
     pub(crate) cursor_position: Option<PhysicalPosition<f64>>,
     #[cfg(target_os = "linux")]
     pub(crate) linux_route: LinuxWindowRoute,
     #[cfg(target_os = "macos")]
     pub(crate) last_drag_click: Option<(Instant, PhysicalPosition<f64>)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WindowGenerationState {
+    pub(crate) metrics_generation: u64,
+    pub(crate) scene_generation: u64,
+    pub(crate) presented_generation: u64,
+}
+
+impl WindowGenerationState {
+    pub(crate) const fn new_synced() -> Self {
+        Self {
+            metrics_generation: 1,
+            scene_generation: 1,
+            presented_generation: 0,
+        }
+    }
+
+    pub(crate) fn note_metrics_change(&mut self) {
+        self.metrics_generation = self.metrics_generation.saturating_add(1);
+    }
+
+    pub(crate) fn mark_scene_compiled(&mut self) {
+        self.scene_generation = self.metrics_generation;
+    }
+
+    pub(crate) fn mark_presented(&mut self) {
+        self.presented_generation = self.scene_generation;
+    }
+
+    pub(crate) fn scene_is_stale(self) -> bool {
+        self.scene_generation != self.metrics_generation
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -115,7 +149,7 @@ fn sanitize_scale_factor(scale_factor: f64) -> f64 {
 mod tests {
     use crate::window::WindowSize;
 
-    use super::WindowMetrics;
+    use super::{WindowGenerationState, WindowMetrics};
 
     #[test]
     fn metrics_difference_detects_zero_and_scale_changes() {
@@ -130,5 +164,20 @@ mod tests {
             scale_factor: 2.0,
         };
         assert_ne!(old.physical_size, new.physical_size);
+    }
+
+    #[test]
+    fn generation_state_marks_scene_stale_until_compile_catches_up() {
+        let mut state = WindowGenerationState::new_synced();
+        assert!(!state.scene_is_stale());
+
+        state.note_metrics_change();
+        assert!(state.scene_is_stale());
+
+        state.mark_scene_compiled();
+        assert!(!state.scene_is_stale());
+
+        state.mark_presented();
+        assert_eq!(state.presented_generation, state.scene_generation);
     }
 }

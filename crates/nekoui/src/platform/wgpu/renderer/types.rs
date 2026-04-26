@@ -1,9 +1,10 @@
 use std::ops::Range;
 use std::sync::Arc;
+use std::time::Instant;
 
 use bytemuck::{Pod, Zeroable};
 
-use crate::scene::{ClipClass, EffectClass, LogicalBatch};
+use crate::scene::{ClipShape, EffectClass, LayoutBox, LogicalBatch, RectFill, RectPrimitive};
 use crate::style::Color;
 
 #[repr(C)]
@@ -23,6 +24,40 @@ pub(super) struct RectInstance {
     pub(super) corner_radii: [f32; 4],
     pub(super) border_widths: [f32; 4],
     pub(super) border_color: [f32; 4],
+    pub(super) clip_rect_0: [f32; 4],
+    pub(super) clip_corner_radii_0: [f32; 4],
+    pub(super) clip_rect_1: [f32; 4],
+    pub(super) clip_corner_radii_1: [f32; 4],
+}
+
+impl RectInstance {
+    pub(super) fn from_primitive(
+        primitive: &RectPrimitive,
+        rect: LayoutBox,
+        clip_stack: ClipStack,
+        scale_factor: f32,
+        opacity: f32,
+    ) -> Self {
+        let (fill_start_color, fill_end_color, fill_meta) = pack_rect_fill(primitive.fill, opacity);
+        let (clip_rect_0, clip_corner_radii_0, clip_rect_1, clip_corner_radii_1) =
+            pack_clip_stack(clip_stack, scale_factor);
+        Self {
+            rect: scale_layout_box(rect, scale_factor),
+            fill_start_color,
+            fill_end_color,
+            fill_meta,
+            corner_radii: scale_corners(primitive.corner_radii, scale_factor),
+            border_widths: scale_edges(primitive.border_widths, scale_factor),
+            border_color: primitive
+                .border_color
+                .map(|border_color| pack_color(border_color, opacity))
+                .unwrap_or([0.0; 4]),
+            clip_rect_0,
+            clip_corner_radii_0,
+            clip_rect_1,
+            clip_corner_radii_1,
+        }
+    }
 }
 
 #[repr(C)]
@@ -31,6 +66,10 @@ pub(super) struct TextInstance {
     pub(super) rect: [f32; 4],
     pub(super) uv_rect: [f32; 4],
     pub(super) color: [f32; 4],
+    pub(super) clip_rect_0: [f32; 4],
+    pub(super) clip_corner_radii_0: [f32; 4],
+    pub(super) clip_rect_1: [f32; 4],
+    pub(super) clip_corner_radii_1: [f32; 4],
 }
 
 #[repr(C)]
@@ -38,7 +77,157 @@ pub(super) struct TextInstance {
 pub(super) struct ColorTextInstance {
     pub(super) rect: [f32; 4],
     pub(super) uv_rect: [f32; 4],
-    pub(super) alpha: f32,
+    pub(super) alpha: [f32; 4],
+    pub(super) clip_rect_0: [f32; 4],
+    pub(super) clip_corner_radii_0: [f32; 4],
+    pub(super) clip_rect_1: [f32; 4],
+    pub(super) clip_corner_radii_1: [f32; 4],
+}
+
+fn pack_rect_fill(fill: RectFill, opacity: f32) -> ([f32; 4], [f32; 4], [f32; 4]) {
+    match fill {
+        RectFill::Solid(color) => {
+            let packed = pack_color(color, opacity);
+            (packed, packed, [0.0, 0.0, 0.0, 0.0])
+        }
+        RectFill::LinearGradient(gradient) => (
+            pack_color(gradient.start_color, opacity),
+            pack_color(gradient.end_color, opacity),
+            [1.0, gradient.angle_radians, 0.0, 0.0],
+        ),
+    }
+}
+
+fn pack_color(color: Color, opacity: f32) -> [f32; 4] {
+    [color.r, color.g, color.b, color.a * opacity]
+}
+
+pub(super) fn pack_clip_stack(
+    clip_stack: ClipStack,
+    scale_factor: f32,
+) -> ([f32; 4], [f32; 4], [f32; 4], [f32; 4]) {
+    fn pack_slot(clip_shape: Option<ClipShape>, scale_factor: f32) -> ([f32; 4], [f32; 4]) {
+        let Some(clip_shape) = clip_shape else {
+            return ([0.0; 4], [0.0; 4]);
+        };
+
+        match clip_shape {
+            ClipShape::Rect(bounds) => (scale_layout_box(bounds, scale_factor), [0.0; 4]),
+            ClipShape::RoundedRect {
+                bounds,
+                corner_radii,
+            } => (
+                scale_layout_box(bounds, scale_factor),
+                scale_corners(corner_radii, scale_factor),
+            ),
+        }
+    }
+
+    let (clip_rect_0, clip_corner_radii_0) = pack_slot(clip_stack.first, scale_factor);
+    let (clip_rect_1, clip_corner_radii_1) = pack_slot(clip_stack.second, scale_factor);
+    (
+        clip_rect_0,
+        clip_corner_radii_0,
+        clip_rect_1,
+        clip_corner_radii_1,
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub(super) struct ClipStack {
+    pub(super) first: Option<ClipShape>,
+    pub(super) second: Option<ClipShape>,
+}
+
+impl ClipStack {
+    pub(super) fn push(mut self, clip_shape: ClipShape) -> Self {
+        if self.first == Some(clip_shape) || self.second == Some(clip_shape) {
+            return self;
+        }
+
+        if self.first.is_none() {
+            self.first = Some(clip_shape);
+            return self;
+        }
+
+        if self.second.is_none() {
+            self.second = Some(clip_shape);
+            return self;
+        }
+
+        let collapsed = self
+            .scissor_bounds()
+            .and_then(|bounds| intersect_layout_box(bounds, clip_shape.bounds()))
+            .map(ClipShape::Rect)
+            .unwrap_or(ClipShape::Rect(LayoutBox {
+                x: 0.0,
+                y: 0.0,
+                width: 0.0,
+                height: 0.0,
+            }));
+        Self {
+            first: Some(collapsed),
+            second: None,
+        }
+    }
+
+    pub(super) fn scissor_bounds(self) -> Option<LayoutBox> {
+        match (self.first, self.second) {
+            (Some(first), Some(second)) => intersect_layout_box(first.bounds(), second.bounds()),
+            (Some(first), None) => Some(first.bounds()),
+            (None, Some(second)) => Some(second.bounds()),
+            (None, None) => None,
+        }
+    }
+
+    pub(super) fn is_empty(self) -> bool {
+        self.first.is_none() && self.second.is_none()
+    }
+}
+
+fn intersect_layout_box(a: LayoutBox, b: LayoutBox) -> Option<LayoutBox> {
+    let left = a.x.max(b.x);
+    let top = a.y.max(b.y);
+    let right = (a.x + a.width).min(b.x + b.width);
+    let bottom = (a.y + a.height).min(b.y + b.height);
+
+    if right <= left || bottom <= top {
+        return None;
+    }
+
+    Some(LayoutBox {
+        x: left,
+        y: top,
+        width: right - left,
+        height: bottom - top,
+    })
+}
+
+fn scale_layout_box(rect: LayoutBox, scale_factor: f32) -> [f32; 4] {
+    [
+        rect.x * scale_factor,
+        rect.y * scale_factor,
+        rect.width * scale_factor,
+        rect.height * scale_factor,
+    ]
+}
+
+fn scale_corners(corners: crate::style::CornerRadii, scale_factor: f32) -> [f32; 4] {
+    [
+        corners.top_left * scale_factor,
+        corners.top_right * scale_factor,
+        corners.bottom_right * scale_factor,
+        corners.bottom_left * scale_factor,
+    ]
+}
+
+fn scale_edges(edges: crate::style::EdgeWidths, scale_factor: f32) -> [f32; 4] {
+    [
+        edges.top * scale_factor,
+        edges.right * scale_factor,
+        edges.bottom * scale_factor,
+        edges.left * scale_factor,
+    ]
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,8 +275,7 @@ pub(super) struct ActiveBatch {
 pub(super) struct GpuBatch {
     pub(super) pipeline_key: PipelineKey,
     pub(super) texture_binding: TextureBindingKey,
-    pub(super) clip_class: ClipClass,
-    pub(super) clip_bounds: Option<crate::scene::LayoutBox>,
+    pub(super) clip_stack: ClipStack,
     pub(super) effect_class: EffectClass,
     pub(super) instance_range: Range<u32>,
 }
@@ -95,16 +283,7 @@ pub(super) struct GpuBatch {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum BatchClipPolicy {
     None,
-    Rect,
-}
-
-impl From<ClipClass> for BatchClipPolicy {
-    fn from(value: ClipClass) -> Self {
-        match value {
-            ClipClass::None => Self::None,
-            ClipClass::Rect => Self::Rect,
-        }
-    }
+    Bounds,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -133,7 +312,7 @@ pub(super) struct BatchSubmitState {
     pub(super) pipeline_key: PipelineKey,
     pub(super) texture_binding: TextureBindingKey,
     pub(super) clip_policy: BatchClipPolicy,
-    pub(super) clip_bounds: Option<crate::scene::LayoutBox>,
+    pub(super) clip_stack: ClipStack,
     pub(super) effect_policy: BatchEffectPolicy,
     pub(super) effect_render_policy: EffectRenderPolicy,
 }
@@ -144,8 +323,12 @@ impl From<&GpuBatch> for BatchSubmitState {
         Self {
             pipeline_key: batch.pipeline_key,
             texture_binding: batch.texture_binding,
-            clip_policy: batch.clip_class.into(),
-            clip_bounds: batch.clip_bounds,
+            clip_policy: if batch.clip_stack.is_empty() {
+                BatchClipPolicy::None
+            } else {
+                BatchClipPolicy::Bounds
+            },
+            clip_stack: batch.clip_stack,
             effect_policy,
             effect_render_policy: super::submit::effect_render_policy(effect_policy),
         }
@@ -186,7 +369,7 @@ impl GpuBatchBuilder {
 pub(super) struct SceneWalkState {
     pub(super) offset: [f32; 2],
     pub(super) opacity: f32,
-    pub(super) clip: Option<crate::scene::LayoutBox>,
+    pub(super) clip: ClipStack,
 }
 
 pub(super) struct TextPrimitiveParams<'a> {
@@ -224,8 +407,22 @@ impl<'a> LogicalBatchCursor<'a> {
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum RenderOutcome {
     Presented,
+    PresentedSuboptimal,
     Reconfigure,
     RecreateSurface,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SurfaceLifecycleState {
+    Stable,
+    ResizePending {
+        requested: crate::window::WindowSize,
+        stable_after: Instant,
+        session_peak_area: u32,
+    },
+    Occluded,
+    Lost,
     Unavailable,
 }
 
@@ -233,6 +430,6 @@ pub(crate) struct WindowRenderState {
     pub(super) surface: wgpu::Surface<'static>,
     pub(super) config: wgpu::SurfaceConfiguration,
     pub(super) current_size: crate::window::WindowSize,
-    pub(super) suspended: bool,
+    pub(super) surface_state: SurfaceLifecycleState,
     pub(super) prepared_frame: Option<PreparedFrame>,
 }

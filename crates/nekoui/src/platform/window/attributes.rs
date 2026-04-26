@@ -4,8 +4,8 @@ use winit::monitor::MonitorHandle;
 use winit::window::{Fullscreen, Theme, Window as WinitWindow, WindowAttributes};
 
 use crate::element::WindowFrameArea;
-use crate::geometry::{Point, Px};
 use crate::scene::LayoutBox;
+use crate::style::{Point, Px, Size};
 
 use super::model::{
     DisplayId, DisplayInfo, DisplaySelector, WindowAppearance, WindowGeometryPatch, WindowOptions,
@@ -288,7 +288,7 @@ fn resolve_monitor(
         .find(|monitor| display_id_from_monitor(monitor) == target.id)
 }
 
-fn to_logical_size(size_value: crate::geometry::Size<Px>) -> LogicalSize<f64> {
+fn to_logical_size(size_value: Size<Px>) -> LogicalSize<f64> {
     LogicalSize::new(
         f64::from(size_value.width.get()),
         f64::from(size_value.height.get()),

@@ -6,6 +6,10 @@ struct RectInstance {
     corner_radii: vec4<f32>,
     border_widths: vec4<f32>,
     border_color: vec4<f32>,
+    clip_rect_0: vec4<f32>,
+    clip_corner_radii_0: vec4<f32>,
+    clip_rect_1: vec4<f32>,
+    clip_corner_radii_1: vec4<f32>,
 };
 
 @group(1) @binding(0)
@@ -93,11 +97,18 @@ fn fs_main(in: RectVsOut) -> @location(0) vec4<f32> {
     let outer_sdf = rect_sdf(in.local_pos, in.size, rect.corner_radii);
     let aa = max(fwidth(outer_sdf), 1.0);
     let outer_alpha = 1.0 - smoothstep(0.0, aa, outer_sdf);
+    let clip_alpha_value = clip_stack_alpha(
+        rect.clip_rect_0,
+        rect.clip_corner_radii_0,
+        rect.clip_rect_1,
+        rect.clip_corner_radii_1,
+        rect.rect.xy + in.local_pos,
+    );
     let fill_color = sample_fill(in.local_pos, in.size, rect);
 
     let has_border = any(rect.border_widths > vec4<f32>(0.0)) && rect.border_color.a > 0.0;
     if !has_border {
-        return vec4<f32>(fill_color.rgb, fill_color.a * outer_alpha);
+        return vec4<f32>(fill_color.rgb, fill_color.a * outer_alpha * clip_alpha_value);
     }
 
     let inner_origin = vec2<f32>(rect.border_widths.w, rect.border_widths.x);
@@ -117,5 +128,5 @@ fn fs_main(in: RectVsOut) -> @location(0) vec4<f32> {
     );
     let inner_alpha = 1.0 - smoothstep(0.0, aa, inner_sdf);
     let color = mix(rect.border_color, fill_color, inner_alpha);
-    return vec4<f32>(color.rgb, color.a * outer_alpha);
+    return vec4<f32>(color.rgb, color.a * outer_alpha * clip_alpha_value);
 }

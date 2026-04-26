@@ -1,7 +1,6 @@
 mod app;
 mod element;
 pub mod error;
-pub mod geometry;
 mod platform;
 mod scene;
 pub mod style;
@@ -18,11 +17,13 @@ pub use element::{
     AnyElement, Div, Fragment, IntoElement, IntoElements, ParentElement, Text, div, text,
 };
 pub use error::{Error, PlatformError, RuntimeError};
-pub use geometry::{Bounds, Point, Px, Size, bounds, point, px, size};
 pub use style::{
-    AlignItems, BackgroundFill, Color, CornerRadii, Direction, EdgeInsets, EdgeWidths,
-    JustifyContent, LayoutSize, LayoutStyle, Length, LinearGradient, PaintStyle, Style, TextStyle,
-    gradient,
+    Absolute, AlignItems, AlignSelf, Background, BackgroundFill, Border, Bounds, BoxSizing, Color,
+    CornerRadii, Corners, Definite, Direction, Display, EdgeInsets, EdgeWidths, Edges,
+    FlexDirection, FlexWrap, FontFamily, FontStyle, FontWeight, Gap, IntoFontFamilies,
+    JustifyContent, LayoutSize, LayoutStyle, Length, LinearGradient, Overflow, PaintStyle, Percent,
+    Point, Px, Rem, ResolvedStyle, ResolvedTextStyle, Size, Style, TextAlign, TextOverflow,
+    TextStyle, WhiteSpace, bounds, gradient, percent, point, px, rem, size,
 };
 pub use text_system::{
     SharedTextLayout, TextCacheStats, TextLayout, TextMeasureKey, TextRun, TextSystem,

@@ -5,6 +5,7 @@ mod types;
 mod upload;
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use bytemuck::bytes_of;
 use cosmic_text::{Color as CosmicColor, SwashCache};
@@ -24,18 +25,22 @@ use crate::style::Color;
 use crate::text_system::TextSystem;
 use crate::window::WindowSize;
 
-use self::pipelines::{create_rect_bind_group_layout, create_text_texture_bind_group_layout};
+use self::pipelines::{
+    create_rect_bind_group_layout, create_text_instance_bind_group_layout,
+    create_text_texture_bind_group_layout,
+};
 use self::types::{ColorTextInstance, RectInstance, TextInstance, ViewUniform};
 use self::upload::{
-    create_instance_buffer, create_rect_bind_group, create_storage_buffer, stage_write_bytes,
+    create_rect_bind_group, create_storage_buffer, rebuild_storage, stage_write_bytes,
     stage_write_pod_slice,
 };
 
-pub(crate) use self::types::{RenderOutcome, WindowRenderState};
+pub(crate) use self::types::{RenderOutcome, SurfaceLifecycleState, WindowRenderState};
 
 const ATLAS_SIZE: u32 = 2048;
 const STAGING_BELT_CHUNK_SIZE: u64 = 64 * 1024;
 const SHRINK_IDLE_FRAME_THRESHOLD: u32 = 90;
+const RESIZE_STABILITY_GRACE: Duration = Duration::from_millis(40);
 
 pub struct RenderSystem {
     context: WgpuContext,
@@ -49,6 +54,9 @@ pub struct RenderSystem {
     mono_text_pipeline: wgpu::RenderPipeline,
     color_text_pipeline: wgpu::RenderPipeline,
     text_texture_bind_group_layout: BindGroupLayout,
+    text_instance_bind_group_layout: BindGroupLayout,
+    mono_text_bind_group: BindGroup,
+    color_text_bind_group: BindGroup,
     mono_atlas: GlyphAtlas,
     color_atlas: GlyphAtlas,
     swash_cache: SwashCache,
@@ -115,6 +123,8 @@ impl RenderSystem {
         });
         let rect_bind_group_layout = create_rect_bind_group_layout(&context.device);
         let text_texture_bind_group_layout = create_text_texture_bind_group_layout(&context.device);
+        let text_instance_bind_group_layout =
+            create_text_instance_bind_group_layout(&context.device);
         let mono_atlas = GlyphAtlas::new(
             &context.device,
             &text_texture_bind_group_layout,
@@ -152,16 +162,21 @@ impl RenderSystem {
             &rect_bind_group_layout,
             &rect_storage_buffer,
         );
-        let mono_text_instance_buffer = create_instance_buffer::<TextInstance>(
+        let (mono_text_instance_buffer, mono_text_bind_group) = rebuild_storage::<TextInstance>(
             &context.device,
-            "nekoui_mono_text_instances",
+            &text_instance_bind_group_layout,
             mono_text_instance_capacity,
+            "nekoui_mono_text_instances",
+            "nekoui_mono_text_bind_group",
         );
-        let color_text_instance_buffer = create_instance_buffer::<ColorTextInstance>(
-            &context.device,
-            "nekoui_color_text_instances",
-            color_text_instance_capacity,
-        );
+        let (color_text_instance_buffer, color_text_bind_group) =
+            rebuild_storage::<ColorTextInstance>(
+                &context.device,
+                &text_instance_bind_group_layout,
+                color_text_instance_capacity,
+                "nekoui_color_text_instances",
+                "nekoui_color_text_bind_group",
+            );
         let staging_device = context.device.clone();
         let rect_pipeline = pipelines::create_rect_pipeline(
             &context.device,
@@ -173,12 +188,14 @@ impl RenderSystem {
             &context.device,
             &view_bind_group_layout,
             &text_texture_bind_group_layout,
+            &text_instance_bind_group_layout,
             initial_surface_format,
         );
         let color_text_pipeline = pipelines::create_color_text_pipeline(
             &context.device,
             &view_bind_group_layout,
             &text_texture_bind_group_layout,
+            &text_instance_bind_group_layout,
             initial_surface_format,
         );
 
@@ -194,6 +211,9 @@ impl RenderSystem {
             mono_text_pipeline,
             color_text_pipeline,
             text_texture_bind_group_layout,
+            text_instance_bind_group_layout,
+            mono_text_bind_group,
+            color_text_bind_group,
             mono_atlas,
             color_atlas,
             swash_cache: SwashCache::new(),
@@ -231,49 +251,71 @@ impl RenderSystem {
     ) -> Result<WindowRenderState, PlatformError> {
         let current_size = physical_size;
         let physical_size = self.surface_extent_for(physical_size);
-        let config = surface
+        let mut config = surface
             .get_default_config(
                 &self.context.adapter,
                 physical_size.width,
                 physical_size.height,
             )
             .ok_or_else(|| PlatformError::new("surface has no default configuration"))?;
+        config.desired_maximum_frame_latency = 1;
         surface.configure(&self.context.device, &config);
         self.ensure_pipelines_for_format(config.format);
         Ok(WindowRenderState {
             surface,
             config,
             current_size,
-            suspended: false,
+            surface_state: SurfaceLifecycleState::Stable,
             prepared_frame: None,
         })
     }
 
-    pub fn resize(
-        &mut self,
-        state: &mut WindowRenderState,
-        physical_size: WindowSize,
-    ) -> Result<(), PlatformError> {
+    pub fn note_surface_resize(&self, state: &mut WindowRenderState, physical_size: WindowSize) {
         state.current_size = physical_size;
         if physical_size.width == 0 || physical_size.height == 0 {
-            state.suspended = true;
-            return Ok(());
+            state.surface_state = SurfaceLifecycleState::Unavailable;
+            return;
         }
 
-        let physical_size = self.surface_extent_for(physical_size);
-        if !state.suspended
-            && state.config.width == physical_size.width
-            && state.config.height == physical_size.height
+        let peak_area = match state.surface_state {
+            SurfaceLifecycleState::ResizePending {
+                session_peak_area, ..
+            } => session_peak_area.max(physical_size.width.saturating_mul(physical_size.height)),
+            _ => physical_size.width.saturating_mul(physical_size.height),
+        };
+        state.surface_state = SurfaceLifecycleState::ResizePending {
+            requested: physical_size,
+            stable_after: Instant::now() + RESIZE_STABILITY_GRACE,
+            session_peak_area: peak_area,
+        };
+    }
+
+    pub fn note_surface_occlusion(&self, state: &mut WindowRenderState, occluded: bool) {
+        if occluded {
+            state.surface_state = SurfaceLifecycleState::Occluded;
+            return;
+        }
+
+        if state.current_size.width == 0 || state.current_size.height == 0 {
+            state.surface_state = SurfaceLifecycleState::Unavailable;
+            return;
+        }
+
+        let target_size = self.surface_extent_for(state.current_size);
+        state.surface_state = if state.config.width == target_size.width
+            && state.config.height == target_size.height
         {
-            return Ok(());
-        }
-
-        state.config.width = physical_size.width;
-        state.config.height = physical_size.height;
-        state.suspended = false;
-        state.surface.configure(&self.context.device, &state.config);
-        self.ensure_pipelines_for_format(state.config.format);
-        Ok(())
+            SurfaceLifecycleState::Stable
+        } else {
+            SurfaceLifecycleState::ResizePending {
+                requested: state.current_size,
+                stable_after: Instant::now() + RESIZE_STABILITY_GRACE,
+                session_peak_area: state
+                    .current_size
+                    .width
+                    .saturating_mul(state.current_size.height),
+            }
+        };
     }
 
     pub fn recreate_surface(
@@ -282,8 +324,8 @@ impl RenderSystem {
         window: Arc<WinitWindow>,
     ) -> Result<(), PlatformError> {
         state.surface = self.context.create_surface_for_window(window)?;
-        state.suspended = false;
-        self.resize(state, state.current_size)
+        self.note_surface_resize(state, state.current_size);
+        Ok(())
     }
 
     pub fn render(
@@ -295,16 +337,11 @@ impl RenderSystem {
         scale_factor: f64,
     ) -> Result<RenderOutcome, PlatformError> {
         if state.current_size.width == 0 || state.current_size.height == 0 {
+            state.surface_state = SurfaceLifecycleState::Unavailable;
             return Ok(RenderOutcome::Unavailable);
         }
 
-        let target_size = self.surface_extent_for(state.current_size);
-        if state.suspended
-            || state.config.width != target_size.width
-            || state.config.height != target_size.height
-        {
-            self.resize(state, state.current_size)?;
-        }
+        self.configure_surface_if_needed(state)?;
 
         self.prepare_frame(state, scene, text_system, scale_factor as f32);
         let prepared = state
@@ -322,19 +359,22 @@ impl RenderSystem {
             .as_ref()
             .is_some_and(|prepared| prepared.uploaded_buffer_epoch != self.buffer_epoch);
 
-        let frame = match state.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(frame) => frame,
-            wgpu::CurrentSurfaceTexture::Suboptimal(frame) => {
-                drop(frame);
-                self.resize(state, state.current_size)?;
-                return Ok(RenderOutcome::Reconfigure);
-            }
+        let (frame, presented_suboptimal) = match state.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(frame) => (frame, false),
+            wgpu::CurrentSurfaceTexture::Suboptimal(frame) => (frame, true),
             wgpu::CurrentSurfaceTexture::Outdated => {
-                self.resize(state, state.current_size)?;
+                self.note_surface_resize(state, state.current_size);
                 return Ok(RenderOutcome::Reconfigure);
             }
-            wgpu::CurrentSurfaceTexture::Lost => return Ok(RenderOutcome::RecreateSurface),
-            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
+            wgpu::CurrentSurfaceTexture::Lost => {
+                state.surface_state = SurfaceLifecycleState::Lost;
+                return Ok(RenderOutcome::RecreateSurface);
+            }
+            wgpu::CurrentSurfaceTexture::Timeout => {
+                return Ok(RenderOutcome::Unavailable);
+            }
+            wgpu::CurrentSurfaceTexture::Occluded => {
+                state.surface_state = SurfaceLifecycleState::Occluded;
                 return Ok(RenderOutcome::Unavailable);
             }
             wgpu::CurrentSurfaceTexture::Validation => {
@@ -428,15 +468,12 @@ impl RenderSystem {
                             types::PipelineKey::MonoText => {
                                 pass.set_pipeline(&self.mono_text_pipeline);
                                 pass.set_bind_group(0, &self.view_bind_group, &[]);
-                                pass.set_vertex_buffer(0, self.mono_text_instance_buffer.slice(..));
+                                pass.set_bind_group(2, &self.mono_text_bind_group, &[]);
                             }
                             types::PipelineKey::ColorText => {
                                 pass.set_pipeline(&self.color_text_pipeline);
                                 pass.set_bind_group(0, &self.view_bind_group, &[]);
-                                pass.set_vertex_buffer(
-                                    0,
-                                    self.color_text_instance_buffer.slice(..),
-                                );
+                                pass.set_bind_group(2, &self.color_text_bind_group, &[]);
                             }
                         }
                     }
@@ -465,9 +502,9 @@ impl RenderSystem {
                         types::BatchClipPolicy::None => {
                             pass.set_scissor_rect(0, 0, state.config.width, state.config.height);
                         }
-                        types::BatchClipPolicy::Rect => {
+                        types::BatchClipPolicy::Bounds => {
                             let Some(scissor) = submit::clip_bounds_to_scissor_rect(
-                                submit_state.clip_bounds,
+                                submit_state.clip_stack,
                                 scale_factor as f32,
                                 state.config.width,
                                 state.config.height,
@@ -506,7 +543,41 @@ impl RenderSystem {
             prepared.uploaded_buffer_epoch = self.buffer_epoch;
         }
         frame.present();
-        Ok(RenderOutcome::Presented)
+        if presented_suboptimal {
+            self.note_surface_resize(state, state.current_size);
+            Ok(RenderOutcome::PresentedSuboptimal)
+        } else {
+            Ok(RenderOutcome::Presented)
+        }
+    }
+
+    fn configure_surface_if_needed(
+        &mut self,
+        state: &mut WindowRenderState,
+    ) -> Result<(), PlatformError> {
+        let target_size = self.surface_extent_for(state.current_size);
+        let configured_matches =
+            state.config.width == target_size.width && state.config.height == target_size.height;
+
+        let needs_configure = match state.surface_state {
+            SurfaceLifecycleState::ResizePending { .. } | SurfaceLifecycleState::Lost => true,
+            SurfaceLifecycleState::Occluded | SurfaceLifecycleState::Unavailable => {
+                !configured_matches
+            }
+            SurfaceLifecycleState::Stable => !configured_matches,
+        };
+
+        if !needs_configure {
+            state.surface_state = SurfaceLifecycleState::Stable;
+            return Ok(());
+        }
+
+        state.config.width = target_size.width;
+        state.config.height = target_size.height;
+        state.surface.configure(&self.context.device, &state.config);
+        self.ensure_pipelines_for_format(state.config.format);
+        state.surface_state = SurfaceLifecycleState::Stable;
+        Ok(())
     }
 
     fn surface_extent_for(&self, physical_size: WindowSize) -> WindowSize {
@@ -542,10 +613,23 @@ mod tests {
         can_merge_gpu_batches, clip_bounds_to_scissor_rect, effect_render_policy, push_gpu_batch,
     };
     use super::types::{
-        BatchClipPolicy, BatchEffectPolicy, BatchSubmitState, EffectRenderPolicy, GpuBatch,
-        PipelineKey, ScissorRect, TextureBindingKey,
+        BatchClipPolicy, BatchEffectPolicy, BatchSubmitState, ClipStack, ColorTextInstance,
+        EffectRenderPolicy, GpuBatch, PipelineKey, ScissorRect, TextInstance, TextureBindingKey,
     };
-    use crate::scene::{ClipClass, EffectClass, LayoutBox};
+    use crate::scene::{ClipShape, EffectClass, LayoutBox};
+
+    fn rect_clip(bounds: LayoutBox) -> ClipStack {
+        ClipStack {
+            first: Some(ClipShape::Rect(bounds)),
+            second: None,
+        }
+    }
+
+    #[test]
+    fn text_storage_instances_match_wgsl_stride() {
+        assert_eq!(std::mem::size_of::<TextInstance>(), 112);
+        assert_eq!(std::mem::size_of::<ColorTextInstance>(), 112);
+    }
 
     #[test]
     fn gpu_batch_merge_respects_clip_and_effect_boundaries() {
@@ -555,8 +639,7 @@ mod tests {
             GpuBatch {
                 pipeline_key: PipelineKey::MonoText,
                 texture_binding: TextureBindingKey::MonoGlyphAtlas(0),
-                clip_class: ClipClass::None,
-                clip_bounds: None,
+                clip_stack: ClipStack::default(),
                 effect_class: EffectClass::None,
                 instance_range: 0..4,
             },
@@ -566,8 +649,7 @@ mod tests {
             GpuBatch {
                 pipeline_key: PipelineKey::MonoText,
                 texture_binding: TextureBindingKey::MonoGlyphAtlas(0),
-                clip_class: ClipClass::Rect,
-                clip_bounds: Some(LayoutBox {
+                clip_stack: rect_clip(LayoutBox {
                     x: 10.0,
                     y: 20.0,
                     width: 40.0,
@@ -582,8 +664,7 @@ mod tests {
             GpuBatch {
                 pipeline_key: PipelineKey::MonoText,
                 texture_binding: TextureBindingKey::MonoGlyphAtlas(0),
-                clip_class: ClipClass::Rect,
-                clip_bounds: Some(LayoutBox {
+                clip_stack: rect_clip(LayoutBox {
                     x: 10.0,
                     y: 20.0,
                     width: 40.0,
@@ -610,8 +691,7 @@ mod tests {
             GpuBatch {
                 pipeline_key: PipelineKey::Rect,
                 texture_binding: TextureBindingKey::None,
-                clip_class: ClipClass::Rect,
-                clip_bounds: Some(LayoutBox {
+                clip_stack: rect_clip(LayoutBox {
                     x: 4.0,
                     y: 8.0,
                     width: 16.0,
@@ -626,8 +706,7 @@ mod tests {
             GpuBatch {
                 pipeline_key: PipelineKey::Rect,
                 texture_binding: TextureBindingKey::None,
-                clip_class: ClipClass::Rect,
-                clip_bounds: Some(LayoutBox {
+                clip_stack: rect_clip(LayoutBox {
                     x: 4.0,
                     y: 8.0,
                     width: 16.0,
@@ -647,8 +726,7 @@ mod tests {
         let batch = GpuBatch {
             pipeline_key: PipelineKey::ColorText,
             texture_binding: TextureBindingKey::ColorGlyphAtlas(3),
-            clip_class: ClipClass::Rect,
-            clip_bounds: Some(LayoutBox {
+            clip_stack: rect_clip(LayoutBox {
                 x: 1.0,
                 y: 2.0,
                 width: 30.0,
@@ -664,10 +742,10 @@ mod tests {
             submit_state.texture_binding,
             TextureBindingKey::ColorGlyphAtlas(3)
         );
-        assert_eq!(submit_state.clip_policy, BatchClipPolicy::Rect);
+        assert_eq!(submit_state.clip_policy, BatchClipPolicy::Bounds);
         assert_eq!(
-            submit_state.clip_bounds,
-            Some(LayoutBox {
+            submit_state.clip_stack,
+            rect_clip(LayoutBox {
                 x: 1.0,
                 y: 2.0,
                 width: 30.0,
@@ -689,8 +767,7 @@ mod tests {
             GpuBatch {
                 pipeline_key: PipelineKey::Rect,
                 texture_binding: TextureBindingKey::None,
-                clip_class: ClipClass::Rect,
-                clip_bounds: Some(LayoutBox {
+                clip_stack: rect_clip(LayoutBox {
                     x: 0.0,
                     y: 0.0,
                     width: 10.0,
@@ -705,8 +782,7 @@ mod tests {
             GpuBatch {
                 pipeline_key: PipelineKey::Rect,
                 texture_binding: TextureBindingKey::None,
-                clip_class: ClipClass::Rect,
-                clip_bounds: Some(LayoutBox {
+                clip_stack: rect_clip(LayoutBox {
                     x: 2.0,
                     y: 0.0,
                     width: 10.0,
@@ -729,8 +805,7 @@ mod tests {
             GpuBatch {
                 pipeline_key: PipelineKey::MonoText,
                 texture_binding: TextureBindingKey::MonoGlyphAtlas(1),
-                clip_class: ClipClass::None,
-                clip_bounds: None,
+                clip_stack: ClipStack::default(),
                 effect_class: EffectClass::None,
                 instance_range: 0..2,
             },
@@ -740,8 +815,7 @@ mod tests {
             GpuBatch {
                 pipeline_key: PipelineKey::MonoText,
                 texture_binding: TextureBindingKey::MonoGlyphAtlas(2),
-                clip_class: ClipClass::None,
-                clip_bounds: None,
+                clip_stack: ClipStack::default(),
                 effect_class: EffectClass::None,
                 instance_range: 2..4,
             },
@@ -754,7 +828,7 @@ mod tests {
     #[test]
     fn clip_bounds_to_scissor_rect_clamps_to_viewport() {
         let scissor = clip_bounds_to_scissor_rect(
-            Some(LayoutBox {
+            rect_clip(LayoutBox {
                 x: -4.25,
                 y: 2.25,
                 width: 20.75,

@@ -31,9 +31,9 @@ use crate::platform::window::{
 use crate::text_system::TextSystem;
 
 use super::window_runtime::{
-    RuntimeWindow, WindowMetrics, current_window_metrics, metrics_from_physical_size,
-    metrics_from_scale_change, window_can_present, window_depends_on_dirty_views,
-    window_metrics_changed,
+    RuntimeWindow, WindowGenerationState, WindowMetrics, current_window_metrics,
+    metrics_from_physical_size, metrics_from_scale_change, window_can_present,
+    window_depends_on_dirty_views, window_metrics_changed,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -168,7 +168,8 @@ impl AppRuntime {
                 compiled_scene,
                 render_state,
                 presentation_pending: true,
-                metrics_scene_sync_pending: false,
+                redraw_requested: false,
+                generation_state: WindowGenerationState::new_synced(),
                 occluded: false,
                 cursor_position: None,
                 #[cfg(target_os = "linux")]
@@ -177,7 +178,9 @@ impl AppRuntime {
                 last_drag_click: None,
             },
         );
-        native_window.request_redraw();
+        if let Some(runtime_window) = self.windows.get_mut(&native_window.id()) {
+            request_window_redraw(runtime_window);
+        }
         Ok(())
     }
 
@@ -233,6 +236,7 @@ impl AppRuntime {
             }
             if dirty.needs_scene_compile() {
                 runtime_window.compiled_scene = runtime_window.retained_tree.compile_scene();
+                runtime_window.generation_state.mark_scene_compiled();
                 mark_window_pending(runtime_window, "dirty_scene_compile");
             }
         }
@@ -337,7 +341,7 @@ impl AppRuntime {
             };
             sync_window_to_native_state(runtime_window, text_system, render_system.as_mut());
             if runtime_window.presentation_pending && window_can_present(runtime_window) {
-                runtime_window.native_window.request_redraw();
+                request_window_redraw(runtime_window);
             }
         }
     }
@@ -419,7 +423,7 @@ impl ApplicationHandler<RunnerEvent> for AppRuntime {
                         metrics,
                         text_system,
                         render_system.as_mut(),
-                        false,
+                        true,
                     );
                 }
             }
@@ -443,7 +447,7 @@ impl ApplicationHandler<RunnerEvent> for AppRuntime {
                         metrics,
                         text_system,
                         render_system.as_mut(),
-                        false,
+                        true,
                     );
                 }
             }
@@ -565,6 +569,10 @@ impl ApplicationHandler<RunnerEvent> for AppRuntime {
                 if let Some(runtime_window) = self.windows.get_mut(&window_id) {
                     runtime_window.occluded = occluded;
                     runtime_window.public_window.set_visible(!occluded);
+                    if let Some(render_system) = self.render_system.as_ref() {
+                        render_system
+                            .note_surface_occlusion(&mut runtime_window.render_state, occluded);
+                    }
                     if !occluded {
                         mark_window_pending(runtime_window, "occluded_false");
                     }
@@ -579,8 +587,9 @@ impl ApplicationHandler<RunnerEvent> for AppRuntime {
                 if let (Some(render_system), Some(runtime_window)) =
                     (render_system.as_mut(), windows.get_mut(&window_id))
                 {
+                    runtime_window.redraw_requested = false;
                     sync_window_to_native_state(runtime_window, text_system, Some(render_system));
-                    let metrics_scene_sync_pending = runtime_window.metrics_scene_sync_pending;
+                    sync_window_scene_to_latest_metrics(runtime_window, text_system);
                     match render_system.render(
                         &mut runtime_window.render_state,
                         &runtime_window.compiled_scene,
@@ -589,18 +598,12 @@ impl ApplicationHandler<RunnerEvent> for AppRuntime {
                         runtime_window.public_window.scale_factor(),
                     ) {
                         Ok(RenderOutcome::Presented) => {
-                            if metrics_scene_sync_pending {
-                                runtime_window.retained_tree.compute_layout(
-                                    runtime_window.public_window.content_size(),
-                                    text_system,
-                                );
-                                runtime_window.compiled_scene =
-                                    runtime_window.retained_tree.compile_scene();
-                                runtime_window.metrics_scene_sync_pending = false;
-                                mark_window_pending(runtime_window, "post_present_scene_sync");
-                            } else {
-                                runtime_window.presentation_pending = false;
-                            }
+                            runtime_window.generation_state.mark_presented();
+                            runtime_window.presentation_pending = false;
+                        }
+                        Ok(RenderOutcome::PresentedSuboptimal) => {
+                            runtime_window.generation_state.mark_presented();
+                            mark_window_pending(runtime_window, "render_presented_suboptimal");
                         }
                         Ok(RenderOutcome::Reconfigure) => {
                             mark_window_pending(runtime_window, "render_reconfigure");
@@ -636,9 +639,7 @@ impl ApplicationHandler<RunnerEvent> for AppRuntime {
 
 fn mark_window_pending(runtime_window: &mut RuntimeWindow, _reason: &'static str) {
     runtime_window.presentation_pending = true;
-    if window_can_present(runtime_window) {
-        runtime_window.native_window.request_redraw();
-    }
+    request_window_redraw(runtime_window);
 }
 
 fn window_frame_area_at_cursor(
@@ -651,9 +652,9 @@ fn window_frame_area_at_cursor(
     let cursor_position = runtime_window.cursor_position?;
 
     let scale = runtime_window.public_window.scale_factor() as f32;
-    let logical_point = crate::geometry::Point::new(
-        crate::geometry::px(cursor_position.x as f32 / scale),
-        crate::geometry::px(cursor_position.y as f32 / scale),
+    let logical_point = crate::style::Point::new(
+        crate::style::px(cursor_position.x as f32 / scale),
+        crate::style::px(cursor_position.y as f32 / scale),
     );
 
     runtime_window
@@ -668,6 +669,9 @@ fn sync_window_metrics(
     render_system: Option<&mut RenderSystem>,
     sync_scene_now: bool,
 ) {
+    let metrics_changed = window_metrics_changed(runtime_window, metrics);
+    let physical_size_changed =
+        runtime_window.public_window.physical_size() != metrics.physical_size;
     runtime_window.public_window.set_content_metrics(
         metrics.logical_size,
         current_frame_size(runtime_window.native_window.as_ref()),
@@ -684,20 +688,49 @@ fn sync_window_metrics(
     runtime_window
         .public_window
         .set_current_display(current_display_id(runtime_window.native_window.as_ref()));
-    if let Some(render_system) = render_system {
-        let _ = render_system.resize(&mut runtime_window.render_state, metrics.physical_size);
+
+    if physical_size_changed && let Some(render_system) = render_system {
+        render_system.note_surface_resize(&mut runtime_window.render_state, metrics.physical_size);
     }
-    if sync_scene_now {
+    if metrics_changed {
+        runtime_window.generation_state.note_metrics_change();
+    }
+    if sync_scene_now && (metrics_changed || runtime_window.generation_state.scene_is_stale()) {
         runtime_window
             .retained_tree
             .compute_layout(metrics.logical_size, text_system);
         sync_window_frame_hit_test(runtime_window);
         runtime_window.compiled_scene = runtime_window.retained_tree.compile_scene();
-        runtime_window.metrics_scene_sync_pending = false;
-    } else {
-        runtime_window.metrics_scene_sync_pending = true;
+        runtime_window.generation_state.mark_scene_compiled();
     }
-    mark_window_pending(runtime_window, "sync_window_metrics");
+    if metrics_changed || sync_scene_now {
+        mark_window_pending(runtime_window, "sync_window_metrics");
+    }
+}
+
+fn request_window_redraw(runtime_window: &mut RuntimeWindow) {
+    if !window_can_present(runtime_window) || runtime_window.redraw_requested {
+        return;
+    }
+
+    runtime_window.native_window.request_redraw();
+    runtime_window.redraw_requested = true;
+}
+
+fn sync_window_scene_to_latest_metrics(
+    runtime_window: &mut RuntimeWindow,
+    text_system: &mut TextSystem,
+) {
+    if !runtime_window.generation_state.scene_is_stale() {
+        return;
+    }
+
+    runtime_window
+        .retained_tree
+        .compute_layout(runtime_window.public_window.content_size(), text_system);
+    sync_window_frame_hit_test(runtime_window);
+    runtime_window.compiled_scene = runtime_window.retained_tree.compile_scene();
+    runtime_window.generation_state.mark_scene_compiled();
 }
 
 fn sync_window_frame_hit_test(runtime_window: &RuntimeWindow) {

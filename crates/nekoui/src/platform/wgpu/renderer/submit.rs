@@ -12,8 +12,7 @@ pub(super) fn effect_render_policy(effect_policy: BatchEffectPolicy) -> EffectRe
 pub(super) fn can_merge_gpu_batches(previous: &GpuBatch, next: &GpuBatch) -> bool {
     previous.pipeline_key == next.pipeline_key
         && previous.texture_binding == next.texture_binding
-        && previous.clip_class == next.clip_class
-        && previous.clip_bounds == next.clip_bounds
+        && previous.clip_stack == next.clip_stack
         && previous.effect_class == next.effect_class
         && previous.instance_range.end == next.instance_range.start
 }
@@ -27,12 +26,12 @@ pub(super) fn push_gpu_batch(batches: &mut Vec<GpuBatch>, batch: GpuBatch) {
 }
 
 pub(super) fn clip_bounds_to_scissor_rect(
-    clip_bounds: Option<crate::scene::LayoutBox>,
+    clip_stack: super::types::ClipStack,
     scale_factor: f32,
     viewport_width: u32,
     viewport_height: u32,
 ) -> Option<ScissorRect> {
-    let clip_bounds = clip_bounds?;
+    let clip_bounds = clip_stack.scissor_bounds()?;
     let scale_factor = scale_factor.max(f32::MIN_POSITIVE);
     let left = (clip_bounds.x * scale_factor).floor().max(0.0);
     let top = (clip_bounds.y * scale_factor).floor().max(0.0);

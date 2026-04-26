@@ -12,5 +12,6 @@ pub(crate) const TEXT_SHADER: &str = concat!(
     include_str!("lib/common.wgsl"),
     include_str!("lib/color.wgsl"),
     include_str!("lib/geometry.wgsl"),
+    include_str!("lib/clip.wgsl"),
     include_str!("text.wgsl"),
 );

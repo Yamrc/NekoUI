@@ -46,19 +46,6 @@ fn align_copy_size(size: u64) -> u64 {
     size.next_multiple_of(wgpu::COPY_BUFFER_ALIGNMENT)
 }
 
-pub(super) fn create_instance_buffer<T: Pod>(
-    device: &Device,
-    label: &str,
-    capacity: usize,
-) -> Buffer {
-    device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some(label),
-        size: (std::mem::size_of::<T>() * capacity.max(1)) as u64,
-        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    })
-}
-
 pub(super) fn create_storage_buffer<T: Pod>(
     device: &Device,
     label: &str,
@@ -72,13 +59,14 @@ pub(super) fn create_storage_buffer<T: Pod>(
     })
 }
 
-pub(super) fn create_rect_bind_group(
+pub(super) fn create_storage_bind_group(
     device: &Device,
     layout: &BindGroupLayout,
     buffer: &Buffer,
+    label: &'static str,
 ) -> BindGroup {
     device.create_bind_group(&BindGroupDescriptor {
-        label: Some("nekoui_rect_bind_group"),
+        label: Some(label),
         layout,
         entries: &[BindGroupEntry {
             binding: 0,
@@ -87,44 +75,79 @@ pub(super) fn create_rect_bind_group(
     })
 }
 
-pub(super) fn maybe_shrink_instance_buffer<T: Pod>(
+pub(super) fn create_rect_bind_group(
+    device: &Device,
+    layout: &BindGroupLayout,
+    buffer: &Buffer,
+) -> BindGroup {
+    create_storage_bind_group(device, layout, buffer, "nekoui_rect_bind_group")
+}
+
+struct StorageBufferResizeSlot<'a> {
+    min_capacity: usize,
+    capacity: &'a mut usize,
+    low_usage_frames: &'a mut u32,
+    buffer: &'a mut Buffer,
+    bind_group: &'a mut BindGroup,
+    layout: &'a BindGroupLayout,
+    buffer_label: &'static str,
+    bind_group_label: &'static str,
+}
+
+fn maybe_shrink_storage_buffer<T: Pod>(
     device: &Device,
     count: usize,
-    min_capacity: usize,
-    capacity: &mut usize,
-    low_usage_frames: &mut u32,
-    buffer: &mut Buffer,
-    label: &str,
+    slot: StorageBufferResizeSlot<'_>,
 ) -> bool {
-    if *capacity <= min_capacity {
-        *low_usage_frames = 0;
+    if *slot.capacity <= slot.min_capacity {
+        *slot.low_usage_frames = 0;
         return false;
     }
 
-    if count.saturating_mul(4) > *capacity {
-        *low_usage_frames = 0;
+    if count.saturating_mul(4) > *slot.capacity {
+        *slot.low_usage_frames = 0;
         return false;
     }
 
-    *low_usage_frames += 1;
-    if *low_usage_frames < SHRINK_IDLE_FRAME_THRESHOLD {
+    *slot.low_usage_frames += 1;
+    if *slot.low_usage_frames < SHRINK_IDLE_FRAME_THRESHOLD {
         return false;
     }
 
     let target = count
         .max(1)
         .saturating_mul(2)
-        .max(min_capacity)
+        .max(slot.min_capacity)
         .next_power_of_two();
-    if target >= *capacity {
-        *low_usage_frames = 0;
+    if target >= *slot.capacity {
+        *slot.low_usage_frames = 0;
         return false;
     }
 
-    *capacity = target;
-    *buffer = create_instance_buffer::<T>(device, label, *capacity);
-    *low_usage_frames = 0;
+    *slot.capacity = target;
+    let (new_buffer, new_bind_group) = rebuild_storage::<T>(
+        device,
+        slot.layout,
+        *slot.capacity,
+        slot.buffer_label,
+        slot.bind_group_label,
+    );
+    *slot.buffer = new_buffer;
+    *slot.bind_group = new_bind_group;
+    *slot.low_usage_frames = 0;
     true
+}
+
+pub(super) fn rebuild_storage<T: Pod>(
+    device: &Device,
+    layout: &BindGroupLayout,
+    capacity: usize,
+    buffer_label: &str,
+    bind_group_label: &'static str,
+) -> (Buffer, BindGroup) {
+    let buffer = create_storage_buffer::<T>(device, buffer_label, capacity);
+    let bind_group = create_storage_bind_group(device, layout, &buffer, bind_group_label);
+    (buffer, bind_group)
 }
 
 pub(super) fn rebuild_rect_storage(
@@ -132,8 +155,13 @@ pub(super) fn rebuild_rect_storage(
     layout: &BindGroupLayout,
     capacity: usize,
 ) -> (Buffer, BindGroup) {
-    let buffer = create_storage_buffer::<RectInstance>(device, "nekoui_rect_instances", capacity);
-    let bind_group = create_rect_bind_group(device, layout, &buffer);
+    let (buffer, bind_group) = rebuild_storage::<RectInstance>(
+        device,
+        layout,
+        capacity,
+        "nekoui_rect_instances",
+        "nekoui_rect_bind_group",
+    );
     (buffer, bind_group)
 }
 
@@ -196,23 +224,32 @@ impl RenderSystem {
         while self.mono_text_instance_capacity < count {
             self.mono_text_instance_capacity *= 2;
         }
-        self.mono_text_instance_buffer = create_instance_buffer::<TextInstance>(
+        let (buffer, bind_group) = rebuild_storage::<TextInstance>(
             &self.context.device,
-            "nekoui_mono_text_instances",
+            &self.text_instance_bind_group_layout,
             self.mono_text_instance_capacity,
+            "nekoui_mono_text_instances",
+            "nekoui_mono_text_bind_group",
         );
+        self.mono_text_instance_buffer = buffer;
+        self.mono_text_bind_group = bind_group;
         self.buffer_epoch = self.buffer_epoch.saturating_add(1);
     }
 
     pub(super) fn maybe_shrink_mono_text_capacity(&mut self, count: usize) {
-        if maybe_shrink_instance_buffer::<TextInstance>(
+        if maybe_shrink_storage_buffer::<TextInstance>(
             &self.context.device,
             count,
-            256,
-            &mut self.mono_text_instance_capacity,
-            &mut self.mono_text_low_usage_frames,
-            &mut self.mono_text_instance_buffer,
-            "nekoui_mono_text_instances",
+            StorageBufferResizeSlot {
+                min_capacity: 256,
+                capacity: &mut self.mono_text_instance_capacity,
+                low_usage_frames: &mut self.mono_text_low_usage_frames,
+                buffer: &mut self.mono_text_instance_buffer,
+                bind_group: &mut self.mono_text_bind_group,
+                layout: &self.text_instance_bind_group_layout,
+                buffer_label: "nekoui_mono_text_instances",
+                bind_group_label: "nekoui_mono_text_bind_group",
+            },
         ) {
             self.buffer_epoch = self.buffer_epoch.saturating_add(1);
         }
@@ -225,23 +262,32 @@ impl RenderSystem {
         while self.color_text_instance_capacity < count {
             self.color_text_instance_capacity *= 2;
         }
-        self.color_text_instance_buffer = create_instance_buffer::<ColorTextInstance>(
+        let (buffer, bind_group) = rebuild_storage::<ColorTextInstance>(
             &self.context.device,
-            "nekoui_color_text_instances",
+            &self.text_instance_bind_group_layout,
             self.color_text_instance_capacity,
+            "nekoui_color_text_instances",
+            "nekoui_color_text_bind_group",
         );
+        self.color_text_instance_buffer = buffer;
+        self.color_text_bind_group = bind_group;
         self.buffer_epoch = self.buffer_epoch.saturating_add(1);
     }
 
     pub(super) fn maybe_shrink_color_text_capacity(&mut self, count: usize) {
-        if maybe_shrink_instance_buffer::<ColorTextInstance>(
+        if maybe_shrink_storage_buffer::<ColorTextInstance>(
             &self.context.device,
             count,
-            64,
-            &mut self.color_text_instance_capacity,
-            &mut self.color_text_low_usage_frames,
-            &mut self.color_text_instance_buffer,
-            "nekoui_color_text_instances",
+            StorageBufferResizeSlot {
+                min_capacity: 64,
+                capacity: &mut self.color_text_instance_capacity,
+                low_usage_frames: &mut self.color_text_low_usage_frames,
+                buffer: &mut self.color_text_instance_buffer,
+                bind_group: &mut self.color_text_bind_group,
+                layout: &self.text_instance_bind_group_layout,
+                buffer_label: "nekoui_color_text_instances",
+                bind_group_label: "nekoui_color_text_bind_group",
+            },
         ) {
             self.buffer_epoch = self.buffer_epoch.saturating_add(1);
         }

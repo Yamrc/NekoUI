@@ -18,9 +18,9 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::element::WindowFrameArea;
-use crate::geometry::{Point, Px};
 use crate::platform::window::WindowOptions;
 use crate::scene::LayoutBox;
+use crate::style::{Point, Px};
 
 pub(crate) fn decorate_attributes(
     attributes: WindowAttributes,

@@ -1,7 +1,7 @@
 use std::ops::Range;
 use std::sync::Arc;
 
-use crate::style::{Color, CornerRadii, EdgeWidths, LinearGradient};
+use crate::style::{Color, CornerRadii, EdgeWidths, LinearGradient, PaintStyle};
 use crate::text_system::SharedTextLayout;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -62,7 +62,52 @@ pub(crate) struct Transform2D {
 
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub(crate) struct ClipInfo {
-    pub bounds: Option<LayoutBox>,
+    pub shape: Option<ClipShape>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum ClipShape {
+    Rect(LayoutBox),
+    RoundedRect {
+        bounds: LayoutBox,
+        corner_radii: CornerRadii,
+    },
+}
+
+impl ClipShape {
+    pub(crate) fn bounds(self) -> LayoutBox {
+        match self {
+            Self::Rect(bounds) => bounds,
+            Self::RoundedRect { bounds, .. } => bounds,
+        }
+    }
+
+    pub(crate) fn class(self) -> ClipClass {
+        match self {
+            Self::Rect(_) => ClipClass::Rect,
+            Self::RoundedRect { .. } => ClipClass::RoundedRect,
+        }
+    }
+
+    pub(crate) fn translate(self, dx: f32, dy: f32) -> Self {
+        let translate_bounds = |bounds: LayoutBox| LayoutBox {
+            x: bounds.x + dx,
+            y: bounds.y + dy,
+            width: bounds.width,
+            height: bounds.height,
+        };
+
+        match self {
+            Self::Rect(bounds) => Self::Rect(translate_bounds(bounds)),
+            Self::RoundedRect {
+                bounds,
+                corner_radii,
+            } => Self::RoundedRect {
+                bounds: translate_bounds(bounds),
+                corner_radii,
+            },
+        }
+    }
 }
 
 pub(crate) type EffectMask = u32;
@@ -90,6 +135,7 @@ pub(crate) enum ClipClass {
     #[default]
     None,
     Rect,
+    RoundedRect,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -150,6 +196,25 @@ pub(crate) struct RectPrimitive {
     pub border_widths: EdgeWidths,
     pub border_color: Option<Color>,
     pub opacity: f32,
+}
+
+impl RectPrimitive {
+    pub(crate) fn from_paint(bounds: LayoutBox, paint: &PaintStyle) -> Option<Self> {
+        let background = paint.rect_background()?;
+        Some(Self {
+            bounds,
+            fill: match background {
+                crate::style::Background::Solid(color) => RectFill::Solid(color),
+                crate::style::Background::LinearGradient(gradient) => {
+                    RectFill::LinearGradient(gradient)
+                }
+            },
+            corner_radii: paint.corner_radii,
+            border_widths: paint.border.widths,
+            border_color: paint.border.color,
+            opacity: 1.0,
+        })
+    }
 }
 
 #[derive(Debug, Clone)]

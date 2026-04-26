@@ -31,6 +31,7 @@ smallvec.workspace = true
 swash.workspace = true
 taffy.workspace = true
 thiserror.workspace = true
+unicode-segmentation.workspace = true
 wgpu.workspace = true
 winit.workspace = true
 

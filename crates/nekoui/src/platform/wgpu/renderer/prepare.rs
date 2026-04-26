@@ -10,9 +10,9 @@ use super::{
     RenderSystem,
     submit::push_gpu_batch,
     types::{
-        ActiveBatch, ColorTextInstance, GpuBatch, LogicalBatchCursor, PipelineKey, PreparedFrame,
-        PreparedFrameKey, RectInstance, SceneWalkState, TextInstance, TextPrimitiveParams,
-        TextureBindingKey,
+        ActiveBatch, ClipStack, ColorTextInstance, GpuBatch, LogicalBatchCursor, PipelineKey,
+        PreparedFrame, PreparedFrameKey, RectInstance, SceneWalkState, TextInstance,
+        TextPrimitiveParams, TextureBindingKey, pack_clip_stack,
     },
 };
 
@@ -91,7 +91,7 @@ impl RenderSystem {
             SceneWalkState {
                 offset: [0.0, 0.0],
                 opacity: 1.0,
-                clip: None,
+                clip: ClipStack::default(),
             },
             &mut batch_cursor,
         );
@@ -150,16 +150,14 @@ impl RenderSystem {
             parent_state.offset[1] + node.transform.ty,
         ];
         let current_opacity = parent_state.opacity * node.opacity;
-        let local_clip = node.clip.bounds.map(|bounds| crate::scene::LayoutBox {
-            x: bounds.x + current_offset[0],
-            y: bounds.y + current_offset[1],
-            width: bounds.width,
-            height: bounds.height,
-        });
+        let local_clip = node
+            .clip
+            .shape
+            .map(|shape| shape.translate(current_offset[0], current_offset[1]));
         let current_state = SceneWalkState {
             offset: current_offset,
             opacity: current_opacity,
-            clip: super::prepare::intersect_clip(parent_state.clip, local_clip),
+            clip: combine_clip_stack(parent_state.clip, local_clip),
         };
 
         for primitive_index in node.primitive_range.as_range() {
@@ -168,73 +166,25 @@ impl RenderSystem {
                 Primitive::Rect(rect_primitive) => {
                     debug_assert_eq!(batch.material_class, MaterialClass::Rect);
                     let start = self.rect_instances.len() as u32;
-                    let (fill_start_color, fill_end_color, fill_meta) = match rect_primitive.fill {
-                        crate::scene::RectFill::Solid(color) => {
-                            (color, color, [0.0, 0.0, 0.0, 0.0])
-                        }
-                        crate::scene::RectFill::LinearGradient(gradient) => (
-                            gradient.start_color,
-                            gradient.end_color,
-                            [1.0, gradient.angle_radians, 0.0, 0.0],
-                        ),
-                    };
                     let rect_bounds = crate::scene::LayoutBox {
                         x: rect_primitive.bounds.x + current_state.offset[0],
                         y: rect_primitive.bounds.y + current_state.offset[1],
                         width: rect_primitive.bounds.width,
                         height: rect_primitive.bounds.height,
                     };
-                    let Some(clipped_rect) = clip_rect(rect_bounds, current_state.clip) else {
+                    if !intersects_clip(rect_bounds, current_state.clip) {
                         continue;
-                    };
-                    self.rect_instances.push(RectInstance {
-                        rect: [
-                            clipped_rect.x * scale_factor,
-                            clipped_rect.y * scale_factor,
-                            clipped_rect.width * scale_factor,
-                            clipped_rect.height * scale_factor,
-                        ],
-                        fill_start_color: [
-                            fill_start_color.r,
-                            fill_start_color.g,
-                            fill_start_color.b,
-                            fill_start_color.a * current_state.opacity,
-                        ],
-                        fill_end_color: [
-                            fill_end_color.r,
-                            fill_end_color.g,
-                            fill_end_color.b,
-                            fill_end_color.a * current_state.opacity,
-                        ],
-                        fill_meta,
-                        corner_radii: [
-                            rect_primitive.corner_radii.top_left * scale_factor,
-                            rect_primitive.corner_radii.top_right * scale_factor,
-                            rect_primitive.corner_radii.bottom_right * scale_factor,
-                            rect_primitive.corner_radii.bottom_left * scale_factor,
-                        ],
-                        border_widths: [
-                            rect_primitive.border_widths.top * scale_factor,
-                            rect_primitive.border_widths.right * scale_factor,
-                            rect_primitive.border_widths.bottom * scale_factor,
-                            rect_primitive.border_widths.left * scale_factor,
-                        ],
-                        border_color: rect_primitive
-                            .border_color
-                            .map(|border_color| {
-                                [
-                                    border_color.r,
-                                    border_color.g,
-                                    border_color.b,
-                                    border_color.a * current_state.opacity,
-                                ]
-                            })
-                            .unwrap_or([0.0; 4]),
-                    });
+                    }
+                    self.rect_instances.push(RectInstance::from_primitive(
+                        rect_primitive,
+                        rect_bounds,
+                        current_state.clip,
+                        scale_factor,
+                        current_state.opacity,
+                    ));
                     self.push_gpu_batch(
                         PipelineKey::Rect,
                         TextureBindingKey::None,
-                        batch.clip_class,
                         current_state.clip,
                         batch.effect_class,
                         start..self.rect_instances.len() as u32,
@@ -282,14 +232,36 @@ impl RenderSystem {
         params: TextPrimitiveParams<'_>,
     ) {
         let mut active_batch = None;
+        let text_bounds = crate::scene::LayoutBox {
+            x: params.bounds.x + params.scene_state.offset[0],
+            y: params.bounds.y + params.scene_state.offset[1],
+            width: params.bounds.width,
+            height: params.bounds.height,
+        };
+        if !intersects_clip(text_bounds, params.scene_state.clip) {
+            return;
+        }
+        let scaled_clip = params
+            .scene_state
+            .clip
+            .scissor_bounds()
+            .map(|clip| scale_layout_box(clip, scale_factor));
 
         for run in &*params.layout.runs {
             for glyph in &run.glyphs {
+                if !logical_glyph_may_intersect_clip(
+                    glyph,
+                    text_bounds,
+                    params.layout.height,
+                    params.scene_state.clip,
+                ) {
+                    continue;
+                }
+
                 let physical = glyph.physical(
                     (
-                        (params.bounds.x + params.scene_state.offset[0]) * scale_factor,
-                        (params.bounds.y + params.scene_state.offset[1] + run.baseline)
-                            * scale_factor,
+                        text_bounds.x * scale_factor,
+                        (text_bounds.y + run.baseline) * scale_factor,
                     ),
                     scale_factor,
                 );
@@ -304,23 +276,18 @@ impl RenderSystem {
                     width: entry.width as f32,
                     height: entry.height as f32,
                 };
+                if !intersects_clip_bounds(rect, scaled_clip) {
+                    continue;
+                }
                 let uv = crate::scene::LayoutBox {
                     x: entry.uv_rect[0],
                     y: entry.uv_rect[1],
                     width: entry.uv_rect[2],
                     height: entry.uv_rect[3],
                 };
-                let Some((clipped_rect, clipped_uv)) =
-                    clip_text_glyph(rect, uv, params.scene_state.clip)
-                else {
-                    continue;
-                };
-                let rect = [
-                    clipped_rect.x,
-                    clipped_rect.y,
-                    clipped_rect.width,
-                    clipped_rect.height,
-                ];
+                let rect = [rect.x, rect.y, rect.width, rect.height];
+                let (clip_rect_0, clip_corner_radii_0, clip_rect_1, clip_corner_radii_1) =
+                    pack_clip_stack(params.scene_state.clip, scale_factor);
                 let glyph_color = glyph
                     .color_opt
                     .map(super::cosmic_to_style_color)
@@ -332,24 +299,22 @@ impl RenderSystem {
                             &mut active_batch,
                             PipelineKey::MonoText,
                             TextureBindingKey::MonoGlyphAtlas(entry.page_id),
-                            params.batch.clip_class,
                             params.scene_state.clip,
                             params.batch.effect_class,
                         );
                         self.mono_text_instances.push(TextInstance {
                             rect,
-                            uv_rect: [
-                                clipped_uv.x,
-                                clipped_uv.y,
-                                clipped_uv.width,
-                                clipped_uv.height,
-                            ],
+                            uv_rect: [uv.x, uv.y, uv.width, uv.height],
                             color: [
                                 glyph_color.r,
                                 glyph_color.g,
                                 glyph_color.b,
                                 glyph_color.a * params.scene_state.opacity,
                             ],
+                            clip_rect_0,
+                            clip_corner_radii_0,
+                            clip_rect_1,
+                            clip_corner_radii_1,
                         });
                     }
                     GlyphAtlasKind::Color => {
@@ -357,19 +322,17 @@ impl RenderSystem {
                             &mut active_batch,
                             PipelineKey::ColorText,
                             TextureBindingKey::ColorGlyphAtlas(entry.page_id),
-                            params.batch.clip_class,
                             params.scene_state.clip,
                             params.batch.effect_class,
                         );
                         self.color_text_instances.push(ColorTextInstance {
                             rect,
-                            uv_rect: [
-                                clipped_uv.x,
-                                clipped_uv.y,
-                                clipped_uv.width,
-                                clipped_uv.height,
-                            ],
-                            alpha: glyph_color.a * params.scene_state.opacity,
+                            uv_rect: [uv.x, uv.y, uv.width, uv.height],
+                            alpha: [glyph_color.a * params.scene_state.opacity, 0.0, 0.0, 0.0],
+                            clip_rect_0,
+                            clip_corner_radii_0,
+                            clip_rect_1,
+                            clip_corner_radii_1,
                         });
                     }
                 }
@@ -378,7 +341,6 @@ impl RenderSystem {
 
         self.finish_active_batch(
             &mut active_batch,
-            params.batch.clip_class,
             params.scene_state.clip,
             params.batch.effect_class,
         );
@@ -389,8 +351,7 @@ impl RenderSystem {
         active_batch: &mut Option<ActiveBatch>,
         pipeline_key: super::types::PipelineKey,
         texture_binding: super::types::TextureBindingKey,
-        clip_class: crate::scene::ClipClass,
-        clip_bounds: Option<crate::scene::LayoutBox>,
+        clip_stack: ClipStack,
         effect_class: crate::scene::EffectClass,
     ) {
         let next_batch = ActiveBatch {
@@ -408,15 +369,14 @@ impl RenderSystem {
             return;
         }
 
-        self.finish_active_batch(active_batch, clip_class, clip_bounds, effect_class);
+        self.finish_active_batch(active_batch, clip_stack, effect_class);
         *active_batch = Some(next_batch);
     }
 
     fn finish_active_batch(
         &mut self,
         active_batch: &mut Option<ActiveBatch>,
-        clip_class: crate::scene::ClipClass,
-        clip_bounds: Option<crate::scene::LayoutBox>,
+        clip_stack: ClipStack,
         effect_class: crate::scene::EffectClass,
     ) {
         let Some(active_batch) = active_batch.take() else {
@@ -426,8 +386,7 @@ impl RenderSystem {
         self.push_gpu_batch(
             active_batch.pipeline_key,
             active_batch.texture_binding,
-            clip_class,
-            clip_bounds,
+            clip_stack,
             effect_class,
             active_batch.start..self.instance_count_for(active_batch.pipeline_key),
         );
@@ -437,8 +396,7 @@ impl RenderSystem {
         &mut self,
         pipeline_key: PipelineKey,
         texture_binding: TextureBindingKey,
-        clip_class: crate::scene::ClipClass,
-        clip_bounds: Option<crate::scene::LayoutBox>,
+        clip_stack: ClipStack,
         effect_class: crate::scene::EffectClass,
         instance_range: std::ops::Range<u32>,
     ) {
@@ -447,8 +405,7 @@ impl RenderSystem {
             GpuBatch {
                 pipeline_key,
                 texture_binding,
-                clip_class,
-                clip_bounds,
+                clip_stack,
                 effect_class,
                 instance_range,
             },
@@ -456,48 +413,66 @@ impl RenderSystem {
     }
 }
 
-pub(super) fn clip_rect(
-    rect: crate::scene::LayoutBox,
-    clip: Option<crate::scene::LayoutBox>,
-) -> Option<crate::scene::LayoutBox> {
-    clip.map_or(Some(rect), |clip| intersect_rect(rect, clip))
-}
-
-pub(super) fn clip_text_glyph(
-    rect: crate::scene::LayoutBox,
-    uv: crate::scene::LayoutBox,
-    clip: Option<crate::scene::LayoutBox>,
-) -> Option<(crate::scene::LayoutBox, crate::scene::LayoutBox)> {
-    let clipped = clip_rect(rect, clip)?;
+fn intersects_clip(rect: crate::scene::LayoutBox, clip: ClipStack) -> bool {
     if rect.width <= 0.0 || rect.height <= 0.0 {
-        return None;
+        return false;
     }
 
-    let left_ratio = (clipped.x - rect.x) / rect.width;
-    let top_ratio = (clipped.y - rect.y) / rect.height;
-    let right_ratio = (clipped.x + clipped.width - rect.x) / rect.width;
-    let bottom_ratio = (clipped.y + clipped.height - rect.y) / rect.height;
+    if clip.is_empty() {
+        return true;
+    }
 
-    let clipped_uv = crate::scene::LayoutBox {
-        x: uv.x + uv.width * left_ratio,
-        y: uv.y + uv.height * top_ratio,
-        width: uv.width * (right_ratio - left_ratio),
-        height: uv.height * (bottom_ratio - top_ratio),
+    clip.scissor_bounds()
+        .is_some_and(|clip_bounds| intersect_rect(rect, clip_bounds).is_some())
+}
+
+fn intersects_clip_bounds(
+    rect: crate::scene::LayoutBox,
+    clip_bounds: Option<crate::scene::LayoutBox>,
+) -> bool {
+    rect.width > 0.0
+        && rect.height > 0.0
+        && clip_bounds.is_none_or(|clip_bounds| intersect_rect(rect, clip_bounds).is_some())
+}
+
+fn logical_glyph_may_intersect_clip(
+    glyph: &cosmic_text::LayoutGlyph,
+    text_bounds: crate::scene::LayoutBox,
+    layout_height: f32,
+    clip: ClipStack,
+) -> bool {
+    let x_offset = glyph.font_size * glyph.x_offset;
+    let left = text_bounds.x + glyph.x + x_offset.min(0.0);
+    let width = (glyph.w + x_offset.abs()).max(glyph.font_size * 0.5);
+    intersects_clip(
+        crate::scene::LayoutBox {
+            x: left,
+            y: text_bounds.y,
+            width,
+            height: layout_height.max(glyph.font_size),
+        },
+        clip,
+    )
+}
+
+fn scale_layout_box(rect: crate::scene::LayoutBox, scale_factor: f32) -> crate::scene::LayoutBox {
+    crate::scene::LayoutBox {
+        x: rect.x * scale_factor,
+        y: rect.y * scale_factor,
+        width: rect.width * scale_factor,
+        height: rect.height * scale_factor,
+    }
+}
+
+fn combine_clip_stack(
+    clip_stack: ClipStack,
+    local_clip: Option<crate::scene::ClipShape>,
+) -> ClipStack {
+    let Some(local_clip) = local_clip else {
+        return clip_stack;
     };
 
-    Some((clipped, clipped_uv))
-}
-
-pub(super) fn intersect_clip(
-    a: Option<crate::scene::LayoutBox>,
-    b: Option<crate::scene::LayoutBox>,
-) -> Option<crate::scene::LayoutBox> {
-    match (a, b) {
-        (Some(a), Some(b)) => intersect_rect(a, b),
-        (Some(a), None) => Some(a),
-        (None, Some(b)) => Some(b),
-        (None, None) => None,
-    }
+    clip_stack.push(local_clip)
 }
 
 pub(super) fn intersect_rect(

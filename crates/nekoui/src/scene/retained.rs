@@ -3,21 +3,26 @@ use std::sync::Arc;
 use slotmap::{SlotMap, new_key_type};
 use smallvec::SmallVec;
 use taffy::prelude::{
-    AlignItems as TaffyAlignItems, AvailableSpace, Dimension, Display,
+    AlignItems as TaffyAlignItems, AlignSelf as TaffyAlignSelf, AvailableSpace,
+    BoxSizing as TaffyBoxSizing, Dimension, Display as TaffyDisplay,
     JustifyContent as TaffyJustifyContent, LengthPercentage, LengthPercentageAuto,
     NodeId as TaffyNodeId, Rect, Size as TaffySize, Style as TaffyStyle, TaffyAuto, TaffyTree,
 };
-use taffy::style::FlexDirection as TaffyFlexDirection;
+use taffy::style::{FlexDirection as TaffyFlexDirection, Overflow as TaffyOverflow};
 
 use crate::SharedString;
 use crate::element::{SpecArena, SpecKind, SpecNode, SpecNodeId, SpecPayload, WindowFrameArea};
-use crate::style::{AlignItems, Direction, JustifyContent, Length, Style};
+use crate::style::{
+    Absolute, AlignItems, Background, BoxSizing, Definite, Display, FlexDirection, FlexWrap,
+    JustifyContent, Length, Overflow, ResolvedStyle, ResolvedTextStyle,
+};
 use crate::text_system::{SharedTextLayout, TextMeasureKey, TextSystem, measure_key};
 use crate::window::WindowSize;
 
 use super::{
-    ClipClass, ClipInfo, CompiledScene, DirtyLaneMask, EffectClass, EffectMask, EffectRegion,
-    LayoutBox, LogicalBatch, Primitive, PrimitiveRange, SceneNode, SceneNodeId, Transform2D,
+    ClipClass, ClipInfo, ClipShape, CompiledScene, DirtyLaneMask, EffectClass, EffectMask,
+    EffectRegion, LayoutBox, LogicalBatch, Primitive, PrimitiveRange, SceneNode, SceneNodeId,
+    Transform2D,
 };
 
 new_key_type! {
@@ -37,7 +42,7 @@ pub(crate) struct RetainedNode {
     pub children: SmallVec<[NodeId; 4]>,
     pub kind: NodeKind,
     pub key: Option<u64>,
-    pub style: Style,
+    pub style: ResolvedStyle,
     pub window_frame_area: Option<WindowFrameArea>,
     pub layout: LayoutBox,
     pub dirty: DirtyLaneMask,
@@ -69,7 +74,7 @@ enum MeasureContext {
 #[derive(Debug, Clone)]
 struct TextMeasureContext {
     text: SharedString,
-    style: crate::style::TextStyle,
+    style: ResolvedTextStyle,
     last_key: Option<TextMeasureKey>,
     last_layout: Option<SharedTextLayout>,
 }
@@ -221,8 +226,8 @@ impl RetainedTree {
             .paint
             .background
             .map(|background| match background {
-                crate::style::BackgroundFill::Solid(color) => color,
-                crate::style::BackgroundFill::LinearGradient(gradient) => gradient.start_color,
+                Background::Solid(color) => color,
+                Background::LinearGradient(gradient) => gradient.start_color,
             });
         CompiledScene {
             clear_color,
@@ -235,7 +240,7 @@ impl RetainedTree {
 
     pub fn window_frame_area_at(
         &self,
-        point: crate::geometry::Point<crate::geometry::Px>,
+        point: crate::style::Point<crate::style::Px>,
     ) -> Option<WindowFrameArea> {
         self.window_frame_area_at_node(self.root, point, [0.0, 0.0])
     }
@@ -584,7 +589,7 @@ impl RetainedTree {
     fn window_frame_area_at_node(
         &self,
         node_id: NodeId,
-        point: crate::geometry::Point<crate::geometry::Px>,
+        point: crate::style::Point<crate::style::Px>,
         offset: [f32; 2],
     ) -> Option<WindowFrameArea> {
         let node = &self.nodes[node_id];
@@ -695,12 +700,7 @@ impl RetainedTree {
                 ty: node.layout.y,
             },
             clip: ClipInfo {
-                bounds: node.style.paint.clip_children.then_some(LayoutBox {
-                    x: 0.0,
-                    y: 0.0,
-                    width: node.layout.width,
-                    height: node.layout.height,
-                }),
+                shape: clip_shape_for_node(node.style.layout.overflow, bounds, &node.style.paint),
             },
             opacity: node.style.paint.opacity,
             effect_mask: EffectMask::default(),
@@ -709,31 +709,7 @@ impl RetainedTree {
 
         match &node.kind {
             NodeKind::Div => {
-                let border_visible = node.style.paint.border_color.is_some()
-                    && (node.style.paint.border_widths.top > 0.0
-                        || node.style.paint.border_widths.right > 0.0
-                        || node.style.paint.border_widths.bottom > 0.0
-                        || node.style.paint.border_widths.left > 0.0);
-                if let Some(background) = node.style.paint.background.or_else(|| {
-                    border_visible.then_some(crate::style::BackgroundFill::Solid(
-                        crate::style::Color::rgba(0.0, 0.0, 0.0, 0.0),
-                    ))
-                }) {
-                    let rect = super::RectPrimitive {
-                        bounds,
-                        fill: match background {
-                            crate::style::BackgroundFill::Solid(color) => {
-                                super::RectFill::Solid(color)
-                            }
-                            crate::style::BackgroundFill::LinearGradient(gradient) => {
-                                super::RectFill::LinearGradient(gradient)
-                            }
-                        },
-                        corner_radii: node.style.paint.corner_radii,
-                        border_widths: node.style.paint.border_widths,
-                        border_color: node.style.paint.border_color,
-                        opacity: 1.0,
-                    };
+                if let Some(rect) = super::RectPrimitive::from_paint(bounds, &node.style.paint) {
                     primitives.push(Primitive::Rect(rect));
                 }
             }
@@ -809,31 +785,7 @@ impl RetainedTree {
 
         match &node.kind {
             NodeKind::Div => {
-                let border_visible = node.style.paint.border_color.is_some()
-                    && (node.style.paint.border_widths.top > 0.0
-                        || node.style.paint.border_widths.right > 0.0
-                        || node.style.paint.border_widths.bottom > 0.0
-                        || node.style.paint.border_widths.left > 0.0);
-                if let Some(background) = node.style.paint.background.or_else(|| {
-                    border_visible.then_some(crate::style::BackgroundFill::Solid(
-                        crate::style::Color::rgba(0.0, 0.0, 0.0, 0.0),
-                    ))
-                }) {
-                    let rect = super::RectPrimitive {
-                        bounds,
-                        fill: match background {
-                            crate::style::BackgroundFill::Solid(color) => {
-                                super::RectFill::Solid(color)
-                            }
-                            crate::style::BackgroundFill::LinearGradient(gradient) => {
-                                super::RectFill::LinearGradient(gradient)
-                            }
-                        },
-                        corner_radii: node.style.paint.corner_radii,
-                        border_widths: node.style.paint.border_widths,
-                        border_color: node.style.paint.border_color,
-                        opacity: 1.0,
-                    };
+                if let Some(rect) = super::RectPrimitive::from_paint(bounds, &node.style.paint) {
                     primitives.push(Primitive::Rect(rect));
                 }
             }
@@ -897,7 +849,7 @@ fn definite_space(space: AvailableSpace) -> Option<f32> {
     }
 }
 
-fn diff_div_style(old: &Style, new: &Style) -> DirtyLaneMask {
+fn diff_div_style(old: &ResolvedStyle, new: &ResolvedStyle) -> DirtyLaneMask {
     let mut dirty = DirtyLaneMask::empty();
     if old.layout != new.layout {
         dirty |= DirtyLaneMask::LAYOUT;
@@ -908,7 +860,7 @@ fn diff_div_style(old: &Style, new: &Style) -> DirtyLaneMask {
     dirty
 }
 
-fn diff_text_style(old: &Style, new: &Style) -> DirtyLaneMask {
+fn diff_text_style(old: &ResolvedStyle, new: &ResolvedStyle) -> DirtyLaneMask {
     let mut dirty = DirtyLaneMask::empty();
     if old.layout != new.layout {
         dirty |= DirtyLaneMask::LAYOUT;
@@ -916,9 +868,14 @@ fn diff_text_style(old: &Style, new: &Style) -> DirtyLaneMask {
     if old.paint != new.paint || old.text.color != new.text.color {
         dirty |= DirtyLaneMask::PAINT;
     }
-    if old.text.font_family != new.text.font_family
+    if old.text.font_families != new.text.font_families
         || old.text.font_size != new.text.font_size
         || old.text.line_height != new.text.line_height
+        || old.text.font_weight != new.text.font_weight
+        || old.text.font_style != new.text.font_style
+        || old.text.text_align != new.text.text_align
+        || old.text.white_space != new.text.white_space
+        || old.text.text_overflow != new.text.text_overflow
     {
         dirty |= DirtyLaneMask::LAYOUT | DirtyLaneMask::PAINT;
     }
@@ -932,16 +889,28 @@ fn spec_class(spec: &SpecNode) -> NodeClass {
     }
 }
 
-fn div_style_to_taffy(style: &Style) -> TaffyStyle {
+fn div_style_to_taffy(style: &ResolvedStyle) -> TaffyStyle {
     TaffyStyle {
-        display: Display::Flex,
-        flex_direction: match style.layout.direction {
-            Direction::Row => TaffyFlexDirection::Row,
-            Direction::Column => TaffyFlexDirection::Column,
+        display: match style.layout.display {
+            Display::Flex => TaffyDisplay::Flex,
+            Display::Block => TaffyDisplay::Block,
+            Display::None => TaffyDisplay::None,
+        },
+        flex_direction: match style.layout.flex_direction {
+            FlexDirection::Row => TaffyFlexDirection::Row,
+            FlexDirection::Column => TaffyFlexDirection::Column,
         },
         size: TaffySize {
             width: length_to_dimension(style.layout.size.width),
             height: length_to_dimension(style.layout.size.height),
+        },
+        min_size: TaffySize {
+            width: option_definite_to_dimension(style.layout.min_size.width),
+            height: option_definite_to_dimension(style.layout.min_size.height),
+        },
+        max_size: TaffySize {
+            width: option_definite_to_dimension(style.layout.max_size.width),
+            height: option_definite_to_dimension(style.layout.max_size.height),
         },
         margin: Rect {
             left: edge_to_auto(style.layout.margin.left),
@@ -950,14 +919,20 @@ fn div_style_to_taffy(style: &Style) -> TaffyStyle {
             bottom: edge_to_auto(style.layout.margin.bottom),
         },
         padding: Rect {
-            left: edge_to_length(style.layout.padding.left),
-            right: edge_to_length(style.layout.padding.right),
-            top: edge_to_length(style.layout.padding.top),
-            bottom: edge_to_length(style.layout.padding.bottom),
+            left: definite_to_length(style.layout.padding.left),
+            right: definite_to_length(style.layout.padding.right),
+            top: definite_to_length(style.layout.padding.top),
+            bottom: definite_to_length(style.layout.padding.bottom),
+        },
+        border: Rect {
+            left: border_width_to_length(style.paint.border.widths.left),
+            right: border_width_to_length(style.paint.border.widths.right),
+            top: border_width_to_length(style.paint.border.widths.top),
+            bottom: border_width_to_length(style.paint.border.widths.bottom),
         },
         gap: TaffySize {
-            width: LengthPercentage::length(style.layout.gap),
-            height: LengthPercentage::length(style.layout.gap),
+            width: definite_to_length(style.layout.gap.column),
+            height: definite_to_length(style.layout.gap.row),
         },
         align_items: Some(match style.layout.align_items {
             AlignItems::Start => TaffyAlignItems::Start,
@@ -965,32 +940,64 @@ fn div_style_to_taffy(style: &Style) -> TaffyStyle {
             AlignItems::End => TaffyAlignItems::End,
             AlignItems::Stretch => TaffyAlignItems::Stretch,
         }),
+        align_self: style.layout.align_self.map(align_self_to_taffy),
         justify_content: Some(match style.layout.justify_content {
             JustifyContent::Start => TaffyJustifyContent::Start,
             JustifyContent::Center => TaffyJustifyContent::Center,
             JustifyContent::End => TaffyJustifyContent::End,
             JustifyContent::SpaceBetween => TaffyJustifyContent::SpaceBetween,
         }),
+        flex_wrap: match style.layout.flex_wrap {
+            FlexWrap::NoWrap => taffy::style::FlexWrap::NoWrap,
+            FlexWrap::Wrap => taffy::style::FlexWrap::Wrap,
+        },
+        flex_basis: length_to_dimension(style.layout.flex_basis),
+        flex_grow: style.layout.flex_grow,
+        flex_shrink: style.layout.flex_shrink,
+        aspect_ratio: style.layout.aspect_ratio,
+        box_sizing: box_sizing_to_taffy(style.layout.box_sizing),
+        overflow: taffy::geometry::Point {
+            x: overflow_to_taffy(style.layout.overflow),
+            y: overflow_to_taffy(style.layout.overflow),
+        },
         ..Default::default()
     }
 }
 
-fn text_style_to_taffy(style: &Style) -> TaffyStyle {
+fn text_style_to_taffy(style: &ResolvedStyle) -> TaffyStyle {
     TaffyStyle {
-        display: Display::Block,
+        display: TaffyDisplay::Block,
         size: TaffySize {
             width: length_to_dimension(style.layout.size.width),
             height: length_to_dimension(style.layout.size.height),
         },
         min_size: TaffySize {
-            width: Dimension::length(0.0),
-            height: Dimension::AUTO,
+            width: style
+                .layout
+                .min_size
+                .width
+                .map_or(Dimension::length(0.0), definite_to_dimension),
+            height: option_definite_to_dimension(style.layout.min_size.height),
         },
+        max_size: TaffySize {
+            width: option_definite_to_dimension(style.layout.max_size.width),
+            height: option_definite_to_dimension(style.layout.max_size.height),
+        },
+        flex_basis: length_to_dimension(style.layout.flex_basis),
+        flex_grow: style.layout.flex_grow,
+        flex_shrink: style.layout.flex_shrink,
+        aspect_ratio: style.layout.aspect_ratio,
         margin: Rect {
             left: edge_to_auto(style.layout.margin.left),
             right: edge_to_auto(style.layout.margin.right),
             top: edge_to_auto(style.layout.margin.top),
             bottom: edge_to_auto(style.layout.margin.bottom),
+        },
+        align_self: style.layout.align_self.map(align_self_to_taffy),
+        box_sizing: box_sizing_to_taffy(style.layout.box_sizing),
+        overflow: taffy::geometry::Point {
+            x: overflow_to_taffy(style.layout.overflow),
+            y: overflow_to_taffy(style.layout.overflow),
         },
         ..Default::default()
     }
@@ -999,22 +1006,79 @@ fn text_style_to_taffy(style: &Style) -> TaffyStyle {
 fn length_to_dimension(length: Length) -> Dimension {
     match length {
         Length::Auto => Dimension::AUTO,
-        Length::Px(value) => Dimension::length(value.get()),
+        Length::Definite(definite) => definite_to_dimension(definite),
         Length::Fill => Dimension::percent(1.0),
     }
 }
 
-fn edge_to_length(value: f32) -> LengthPercentage {
-    LengthPercentage::length(value)
+fn definite_to_dimension(definite: Definite) -> Dimension {
+    match definite {
+        Definite::Absolute(absolute) => match absolute {
+            Absolute::Px(value) => Dimension::length(value.get()),
+            Absolute::Rem(value) => Dimension::length(value.get()),
+        },
+        Definite::Percent(value) => Dimension::percent(value.get()),
+    }
 }
 
-fn edge_to_auto(value: f32) -> LengthPercentageAuto {
-    LengthPercentageAuto::length(value)
+fn option_definite_to_dimension(value: Option<Definite>) -> Dimension {
+    value.map_or(Dimension::AUTO, definite_to_dimension)
+}
+
+fn definite_to_length(value: Definite) -> LengthPercentage {
+    match value {
+        Definite::Absolute(absolute) => match absolute {
+            Absolute::Px(value) => LengthPercentage::length(value.get()),
+            Absolute::Rem(value) => LengthPercentage::length(value.get()),
+        },
+        Definite::Percent(value) => LengthPercentage::percent(value.get()),
+    }
+}
+
+fn border_width_to_length(value: f32) -> LengthPercentage {
+    LengthPercentage::length(value.max(0.0))
+}
+
+fn edge_to_auto(value: Length) -> LengthPercentageAuto {
+    match value {
+        Length::Auto => LengthPercentageAuto::auto(),
+        Length::Definite(definite) => match definite {
+            Definite::Absolute(absolute) => match absolute {
+                Absolute::Px(value) => LengthPercentageAuto::length(value.get()),
+                Absolute::Rem(value) => LengthPercentageAuto::length(value.get()),
+            },
+            Definite::Percent(value) => LengthPercentageAuto::percent(value.get()),
+        },
+        Length::Fill => LengthPercentageAuto::percent(1.0),
+    }
+}
+
+fn align_self_to_taffy(align_self: crate::style::AlignSelf) -> TaffyAlignSelf {
+    match align_self {
+        AlignItems::Start => TaffyAlignSelf::Start,
+        AlignItems::Center => TaffyAlignSelf::Center,
+        AlignItems::End => TaffyAlignSelf::End,
+        AlignItems::Stretch => TaffyAlignSelf::Stretch,
+    }
+}
+
+fn box_sizing_to_taffy(box_sizing: BoxSizing) -> TaffyBoxSizing {
+    match box_sizing {
+        BoxSizing::ContentBox => TaffyBoxSizing::ContentBox,
+        BoxSizing::BorderBox => TaffyBoxSizing::BorderBox,
+    }
+}
+
+fn overflow_to_taffy(overflow: Overflow) -> TaffyOverflow {
+    match overflow {
+        Overflow::Visible => TaffyOverflow::Visible,
+        Overflow::Hidden => TaffyOverflow::Hidden,
+    }
 }
 
 fn layout_box_contains_point(
     layout: LayoutBox,
-    point: crate::geometry::Point<crate::geometry::Px>,
+    point: crate::style::Point<crate::style::Px>,
 ) -> bool {
     let x = point.x.get();
     let y = point.y.get();
@@ -1074,8 +1138,8 @@ fn assign_batch_meta(
     out: &mut [(ClipClass, EffectClass)],
 ) {
     let node = &scene_nodes[node_id.0 as usize];
-    let clip_class = if node.clip.bounds.is_some() {
-        ClipClass::Rect
+    let clip_class = if let Some(shape) = node.clip.shape {
+        shape.class()
     } else {
         parent_clip
     };
@@ -1094,6 +1158,32 @@ fn assign_batch_meta(
         assign_batch_meta(scene_nodes, child_id, clip_class, effect_class, out);
         child = scene_nodes[child_id.0 as usize].next_sibling;
     }
+}
+
+fn clip_shape_for_node(
+    overflow: Overflow,
+    bounds: LayoutBox,
+    paint: &crate::style::PaintStyle,
+) -> Option<ClipShape> {
+    if overflow != Overflow::Hidden {
+        return None;
+    }
+
+    if has_non_zero_corner_radii(paint.corner_radii) {
+        return Some(ClipShape::RoundedRect {
+            bounds,
+            corner_radii: paint.corner_radii,
+        });
+    }
+
+    Some(ClipShape::Rect(bounds))
+}
+
+fn has_non_zero_corner_radii(corner_radii: crate::style::CornerRadii) -> bool {
+    corner_radii.top_left > 0.0
+        || corner_radii.top_right > 0.0
+        || corner_radii.bottom_right > 0.0
+        || corner_radii.bottom_left > 0.0
 }
 
 fn append_subtree_fragment(
@@ -1136,14 +1226,17 @@ mod tests {
 
     use crate::app::{App, Render};
     use crate::element::{BuildCx, IntoElement, ParentElement, SpecArena};
-    use crate::geometry::px;
     use crate::platform::window::WindowInfoSeed;
     use crate::scene::{Primitive, RectFill};
-    use crate::style::{Color, CornerRadii, EdgeInsets, EdgeWidths, gradient};
+    use crate::style::px;
+    use crate::style::{
+        Absolute, BoxSizing, Color, CornerRadii, EdgeInsets, EdgeWidths, FontFamily, TextAlign,
+        gradient,
+    };
     use crate::text_system::TextSystem;
     use crate::window::{Window, WindowId, WindowInfo, WindowOptions, WindowSize};
 
-    use super::{ClipClass, DirtyLaneMask, EffectClass, NodeKind, RetainedTree};
+    use super::{ClipClass, ClipShape, DirtyLaneMask, EffectClass, NodeKind, RetainedTree};
 
     fn test_window(logical: WindowSize, physical: WindowSize, scale_factor: f64) -> Window {
         Window::from_options(
@@ -1179,7 +1272,7 @@ mod tests {
         let root = crate::div()
             .width(px(200.0))
             .padding(EdgeInsets::all(10.0))
-            .child(crate::text("hello neko ui hello neko ui hello neko ui").font_size(16.0))
+            .child(crate::text("hello neko ui hello neko ui hello neko ui").font_size(px(16.0)))
             .into_any_element();
 
         let mut tree = build_static_tree(root);
@@ -1201,6 +1294,94 @@ mod tests {
             }
             NodeKind::Div => panic!("expected text node"),
         }
+    }
+
+    #[test]
+    fn text_style_inherits_from_parent_div_and_child_can_override() {
+        let inherited_color = Color::rgb(0x112233);
+        let override_color = Color::rgb(0x445566);
+        let root = crate::div()
+            .font_family(["Noto Sans SC", "Segoe UI Emoji"])
+            .font_size(px(24.0))
+            .text_color(inherited_color)
+            .text_center()
+            .child(crate::text("inherited"))
+            .child(crate::text("override").color(override_color))
+            .into_any_element();
+
+        let tree = build_static_tree(root);
+        let first = tree.children(tree.root_id())[0];
+        let second = tree.children(tree.root_id())[1];
+
+        assert_eq!(
+            tree.node(first).style.text.font_families.as_ref(),
+            &[
+                FontFamily::from("Noto Sans SC"),
+                FontFamily::from("Segoe UI Emoji")
+            ]
+        );
+        assert_eq!(
+            tree.node(first).style.text.font_size,
+            Absolute::from(px(24.0))
+        );
+        assert_eq!(tree.node(first).style.text.color, inherited_color);
+        assert_eq!(tree.node(first).style.text.text_align, TextAlign::Center);
+        assert_eq!(tree.node(second).style.text.color, override_color);
+    }
+
+    #[test]
+    fn box_and_paint_style_do_not_inherit_to_text_children() {
+        let root = crate::div()
+            .bg(Color::rgb(0x111111))
+            .border(2.0, Color::rgb(0x222222))
+            .opacity(0.25)
+            .child(crate::text("child"))
+            .into_any_element();
+
+        let tree = build_static_tree(root);
+        let child = tree.children(tree.root_id())[0];
+        assert_eq!(tree.node(child).style.paint.background, None);
+        assert_eq!(
+            tree.node(child).style.paint.border.widths,
+            EdgeWidths::default()
+        );
+        assert_eq!(tree.node(child).style.paint.border.color, None);
+        assert_eq!(tree.node(child).style.paint.opacity, 1.0);
+    }
+
+    #[test]
+    fn align_self_overrides_parent_cross_axis_alignment() {
+        let root = crate::div()
+            .size(crate::style::size(px(200.0).into(), px(100.0).into()))
+            .items_start()
+            .child(crate::div().w(px(20.0)).h(px(20.0)).self_end())
+            .into_any_element();
+
+        let mut tree = build_static_tree(root);
+        let mut text_system = TextSystem::new();
+        tree.compute_layout(WindowSize::new(320, 200), &mut text_system);
+
+        let child = tree.children(tree.root_id())[0];
+        assert_eq!(tree.node(child).layout.y, 80.0);
+    }
+
+    #[test]
+    fn box_sizing_controls_whether_border_and_padding_expand_layout_size() {
+        fn root_width_for(box_sizing: BoxSizing) -> f32 {
+            let root = crate::div()
+                .box_sizing(box_sizing)
+                .w(px(100.0))
+                .p(px(10.0))
+                .border(5.0, Color::rgb(0x222222))
+                .into_any_element();
+            let mut tree = build_static_tree(root);
+            let mut text_system = TextSystem::new();
+            tree.compute_layout(WindowSize::new(500, 200), &mut text_system);
+            tree.root_layout().width
+        }
+
+        assert_eq!(root_width_for(BoxSizing::BorderBox), 100.0);
+        assert_eq!(root_width_for(BoxSizing::ContentBox), 130.0);
     }
 
     #[test]
@@ -1328,7 +1509,7 @@ mod tests {
         let compiled = tree.compile_scene();
 
         assert_eq!(compiled.scene_nodes[0].opacity, 0.5);
-        assert!(compiled.scene_nodes[0].clip.bounds.is_some());
+        assert!(compiled.scene_nodes[0].clip.shape.is_some());
         assert_eq!(compiled.scene_nodes[1].opacity, 0.25);
     }
 
@@ -1442,6 +1623,31 @@ mod tests {
                 .logical_batches
                 .iter()
                 .any(|batch| batch.effect_class == EffectClass::Opacity)
+        );
+    }
+
+    #[test]
+    fn rounded_overflow_hidden_compiles_to_rounded_clip_shape() {
+        let root = crate::div()
+            .clip()
+            .corner_radii(CornerRadii::all(12.0))
+            .child(crate::text("hello"))
+            .into_any_element();
+
+        let mut tree = build_static_tree(root);
+        let mut text_system = TextSystem::new();
+        tree.compute_layout(WindowSize::new(320, 200), &mut text_system);
+        let compiled = tree.compile_scene();
+
+        assert!(matches!(
+            compiled.scene_nodes[0].clip.shape,
+            Some(ClipShape::RoundedRect { .. })
+        ));
+        assert!(
+            compiled
+                .logical_batches
+                .iter()
+                .any(|batch| batch.clip_class == ClipClass::RoundedRect)
         );
     }
 

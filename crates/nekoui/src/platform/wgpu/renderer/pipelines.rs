@@ -3,15 +3,12 @@ use wgpu::{
     BufferBindingType, ColorTargetState, ColorWrites, Device, FragmentState, MultisampleState,
     PipelineCompilationOptions, PipelineLayoutDescriptor, PrimitiveState, RenderPipeline,
     RenderPipelineDescriptor, ShaderModuleDescriptor, ShaderSource, ShaderStages, TextureFormat,
-    VertexBufferLayout, VertexState, VertexStepMode, vertex_attr_array,
+    VertexState,
 };
 
 use crate::platform::wgpu::shader::{RECT_SHADER, TEXT_SHADER};
 
-use super::{
-    RenderSystem,
-    types::{ColorTextInstance, TextInstance},
-};
+use super::RenderSystem;
 
 impl RenderSystem {
     pub(super) fn ensure_pipelines_for_format(&mut self, surface_format: TextureFormat) {
@@ -28,12 +25,14 @@ impl RenderSystem {
             &self.context.device,
             &self.view_bind_group_layout,
             &self.text_texture_bind_group_layout,
+            &self.text_instance_bind_group_layout,
             surface_format,
         );
         self.color_text_pipeline = create_color_text_pipeline(
             &self.context.device,
             &self.view_bind_group_layout,
             &self.text_texture_bind_group_layout,
+            &self.text_instance_bind_group_layout,
             surface_format,
         );
         self.current_surface_format = Some(surface_format);
@@ -98,6 +97,22 @@ pub(super) fn create_rect_pipeline(
     })
 }
 
+pub(super) fn create_text_instance_bind_group_layout(device: &Device) -> BindGroupLayout {
+    device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+        label: Some("nekoui_text_instance_bind_group_layout"),
+        entries: &[BindGroupLayoutEntry {
+            binding: 0,
+            visibility: ShaderStages::VERTEX | ShaderStages::FRAGMENT,
+            ty: BindingType::Buffer {
+                ty: BufferBindingType::Storage { read_only: true },
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        }],
+    })
+}
+
 pub(super) fn create_text_texture_bind_group_layout(device: &Device) -> BindGroupLayout {
     device.create_bind_group_layout(&BindGroupLayoutDescriptor {
         label: Some("nekoui_text_texture_bind_group_layout"),
@@ -126,6 +141,7 @@ pub(super) fn create_mono_text_pipeline(
     device: &Device,
     view_layout: &BindGroupLayout,
     glyph_layout: &BindGroupLayout,
+    text_instance_layout: &BindGroupLayout,
     surface_format: TextureFormat,
 ) -> RenderPipeline {
     let shader = device.create_shader_module(ShaderModuleDescriptor {
@@ -134,7 +150,11 @@ pub(super) fn create_mono_text_pipeline(
     });
     let layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
         label: Some("nekoui_mono_text_pipeline_layout"),
-        bind_group_layouts: &[Some(view_layout), Some(glyph_layout)],
+        bind_group_layouts: &[
+            Some(view_layout),
+            Some(glyph_layout),
+            Some(text_instance_layout),
+        ],
         immediate_size: 0,
     });
     device.create_render_pipeline(&RenderPipelineDescriptor {
@@ -144,11 +164,7 @@ pub(super) fn create_mono_text_pipeline(
             module: &shader,
             entry_point: Some("vs_mono"),
             compilation_options: PipelineCompilationOptions::default(),
-            buffers: &[VertexBufferLayout {
-                array_stride: std::mem::size_of::<TextInstance>() as u64,
-                step_mode: VertexStepMode::Instance,
-                attributes: &vertex_attr_array![0 => Float32x4, 1 => Float32x4, 2 => Float32x4],
-            }],
+            buffers: &[],
         },
         fragment: Some(FragmentState {
             module: &shader,
@@ -172,6 +188,7 @@ pub(super) fn create_color_text_pipeline(
     device: &Device,
     view_layout: &BindGroupLayout,
     glyph_layout: &BindGroupLayout,
+    text_instance_layout: &BindGroupLayout,
     surface_format: TextureFormat,
 ) -> RenderPipeline {
     let shader = device.create_shader_module(ShaderModuleDescriptor {
@@ -180,7 +197,11 @@ pub(super) fn create_color_text_pipeline(
     });
     let layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
         label: Some("nekoui_color_text_pipeline_layout"),
-        bind_group_layouts: &[Some(view_layout), Some(glyph_layout)],
+        bind_group_layouts: &[
+            Some(view_layout),
+            Some(glyph_layout),
+            Some(text_instance_layout),
+        ],
         immediate_size: 0,
     });
     device.create_render_pipeline(&RenderPipelineDescriptor {
@@ -190,11 +211,7 @@ pub(super) fn create_color_text_pipeline(
             module: &shader,
             entry_point: Some("vs_color"),
             compilation_options: PipelineCompilationOptions::default(),
-            buffers: &[VertexBufferLayout {
-                array_stride: std::mem::size_of::<ColorTextInstance>() as u64,
-                step_mode: VertexStepMode::Instance,
-                attributes: &vertex_attr_array![0 => Float32x4, 1 => Float32x4, 2 => Float32],
-            }],
+            buffers: &[],
         },
         fragment: Some(FragmentState {
             module: &shader,

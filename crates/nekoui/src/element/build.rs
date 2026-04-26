@@ -3,7 +3,7 @@ use smallvec::SmallVec;
 
 use crate::SharedString;
 use crate::error::RuntimeError;
-use crate::style::Style;
+use crate::style::{ResolvedStyle, ResolvedTextStyle};
 use crate::window::WindowInfo;
 
 use super::core::{AnyElement, AnyElementKind, Fragment, WindowFrameArea};
@@ -27,7 +27,7 @@ pub(crate) enum SpecPayload {
 pub(crate) struct SpecNode {
     pub kind: SpecKind,
     pub key: Option<u64>,
-    pub style: Style,
+    pub style: ResolvedStyle,
     pub window_frame_area: Option<WindowFrameArea>,
     pub payload: SpecPayload,
     pub first_child: Option<SpecNodeId>,
@@ -105,32 +105,41 @@ impl<'a> BuildCx<'a> {
     }
 
     pub(crate) fn build_root(mut self, root: AnyElement) -> Result<BuildResult, RuntimeError> {
-        let root = self.lower_any(root)?;
+        let root = self.lower_any(root, &ResolvedTextStyle::default())?;
         Ok(BuildResult {
             root,
             referenced_views: self.referenced_views,
         })
     }
 
-    fn lower_any(&mut self, element: AnyElement) -> Result<SpecNodeId, RuntimeError> {
+    fn lower_any(
+        &mut self,
+        element: AnyElement,
+        inherited_text: &ResolvedTextStyle,
+    ) -> Result<SpecNodeId, RuntimeError> {
         match element.kind() {
-            AnyElementKind::Div(div) => self.lower_div(div),
-            AnyElementKind::Text(text) => self.lower_text(text),
+            AnyElementKind::Div(div) => self.lower_div(div, inherited_text),
+            AnyElementKind::Text(text) => self.lower_text(text, inherited_text),
             AnyElementKind::View(view) => {
                 self.referenced_views.insert(view.entity_id);
                 let rendered = (self.view_resolver)(view.entity_id, self.window)?;
-                self.lower_any(rendered)
+                self.lower_any(rendered, inherited_text)
             }
         }
     }
 
-    fn lower_div(&mut self, div: &crate::element::Div) -> Result<SpecNodeId, RuntimeError> {
-        let child_ids = self.lower_fragment(&div.children)?;
+    fn lower_div(
+        &mut self,
+        div: &crate::element::Div,
+        inherited_text: &ResolvedTextStyle,
+    ) -> Result<SpecNodeId, RuntimeError> {
+        let resolved_style = div.style.resolve_with_parent(inherited_text);
+        let child_ids = self.lower_fragment(&div.children, &resolved_style.text)?;
         let first_child = link_siblings(self.arena, child_ids);
         Ok(self.arena.alloc(SpecNode {
             kind: SpecKind::Div,
             key: div.key,
-            style: div.style.clone(),
+            style: resolved_style,
             window_frame_area: div.window_frame_area,
             payload: SpecPayload::None,
             first_child,
@@ -138,11 +147,15 @@ impl<'a> BuildCx<'a> {
         }))
     }
 
-    fn lower_text(&mut self, text: &crate::element::Text) -> Result<SpecNodeId, RuntimeError> {
+    fn lower_text(
+        &mut self,
+        text: &crate::element::Text,
+        inherited_text: &ResolvedTextStyle,
+    ) -> Result<SpecNodeId, RuntimeError> {
         Ok(self.arena.alloc(SpecNode {
             kind: SpecKind::Text,
             key: text.key,
-            style: text.style.clone(),
+            style: text.style.resolve_with_parent(inherited_text),
             window_frame_area: text.window_frame_area,
             payload: SpecPayload::Text(text.content.clone()),
             first_child: None,
@@ -153,10 +166,11 @@ impl<'a> BuildCx<'a> {
     fn lower_fragment(
         &mut self,
         fragment: &Fragment,
+        inherited_text: &ResolvedTextStyle,
     ) -> Result<SmallVec<[SpecNodeId; 4]>, RuntimeError> {
         let mut ids = SmallVec::new();
         for child in fragment.iter() {
-            ids.push(self.lower_any(child.clone())?);
+            ids.push(self.lower_any(child.clone(), inherited_text)?);
         }
         Ok(ids)
     }
