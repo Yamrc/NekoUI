@@ -348,12 +348,10 @@ impl App {
     }
 
     fn dispatch_observers(&self, source_id: u64) -> Result<(), RuntimeError> {
-        let mut callbacks = self
-            .runtime
-            .borrow_mut()
-            .observe_subscriptions
-            .remove(&source_id)
-            .unwrap_or_default();
+        let mut callbacks = {
+            let mut runtime = self.runtime.borrow_mut();
+            std::mem::take(runtime.observe_subscriptions.entry(source_id).or_default())
+        };
 
         for subscription in &mut callbacks {
             if subscription.active.load(Ordering::Relaxed) {
@@ -368,7 +366,7 @@ impl App {
                 .observe_subscriptions
                 .entry(source_id)
                 .or_default()
-                .extend(callbacks);
+                .append(&mut callbacks);
         }
 
         Ok(())
@@ -379,12 +377,10 @@ impl App {
             source_id: event.source_id,
             event_type: event.event_type,
         };
-        let mut callbacks = self
-            .runtime
-            .borrow_mut()
-            .event_subscriptions
-            .remove(&key)
-            .unwrap_or_default();
+        let mut callbacks = {
+            let mut runtime = self.runtime.borrow_mut();
+            std::mem::take(runtime.event_subscriptions.entry(key).or_default())
+        };
 
         for subscription in &mut callbacks {
             if subscription.active.load(Ordering::Relaxed) {
@@ -399,7 +395,7 @@ impl App {
                 .event_subscriptions
                 .entry(key)
                 .or_default()
-                .extend(callbacks);
+                .append(&mut callbacks);
         }
 
         Ok(())

@@ -20,6 +20,7 @@ impl RenderSystem {
             &self.view_bind_group_layout,
             &self.rect_bind_group_layout,
             surface_format,
+            self.pipeline_cache.as_ref(),
         );
         self.mono_text_pipeline = create_mono_text_pipeline(
             &self.context.device,
@@ -27,6 +28,7 @@ impl RenderSystem {
             &self.text_texture_bind_group_layout,
             &self.text_instance_bind_group_layout,
             surface_format,
+            self.pipeline_cache.as_ref(),
         );
         self.color_text_pipeline = create_color_text_pipeline(
             &self.context.device,
@@ -34,6 +36,7 @@ impl RenderSystem {
             &self.text_texture_bind_group_layout,
             &self.text_instance_bind_group_layout,
             surface_format,
+            self.pipeline_cache.as_ref(),
         );
         self.current_surface_format = Some(surface_format);
     }
@@ -42,16 +45,28 @@ impl RenderSystem {
 pub(super) fn create_rect_bind_group_layout(device: &Device) -> BindGroupLayout {
     device.create_bind_group_layout(&BindGroupLayoutDescriptor {
         label: Some("nekoui_rect_bind_group_layout"),
-        entries: &[BindGroupLayoutEntry {
-            binding: 0,
-            visibility: ShaderStages::VERTEX | ShaderStages::FRAGMENT,
-            ty: BindingType::Buffer {
-                ty: BufferBindingType::Storage { read_only: true },
-                has_dynamic_offset: false,
-                min_binding_size: None,
+        entries: &[
+            BindGroupLayoutEntry {
+                binding: 0,
+                visibility: ShaderStages::VERTEX | ShaderStages::FRAGMENT,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
             },
-            count: None,
-        }],
+            BindGroupLayoutEntry {
+                binding: 1,
+                visibility: ShaderStages::FRAGMENT,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+        ],
     })
 }
 
@@ -60,6 +75,7 @@ pub(super) fn create_rect_pipeline(
     view_layout: &BindGroupLayout,
     rect_layout: &BindGroupLayout,
     surface_format: TextureFormat,
+    pipeline_cache: Option<&wgpu::PipelineCache>,
 ) -> RenderPipeline {
     let shader = device.create_shader_module(ShaderModuleDescriptor {
         label: Some("nekoui_rect_shader"),
@@ -93,23 +109,35 @@ pub(super) fn create_rect_pipeline(
         depth_stencil: None,
         multisample: MultisampleState::default(),
         multiview_mask: None,
-        cache: None,
+        cache: pipeline_cache,
     })
 }
 
 pub(super) fn create_text_instance_bind_group_layout(device: &Device) -> BindGroupLayout {
     device.create_bind_group_layout(&BindGroupLayoutDescriptor {
         label: Some("nekoui_text_instance_bind_group_layout"),
-        entries: &[BindGroupLayoutEntry {
-            binding: 0,
-            visibility: ShaderStages::VERTEX | ShaderStages::FRAGMENT,
-            ty: BindingType::Buffer {
-                ty: BufferBindingType::Storage { read_only: true },
-                has_dynamic_offset: false,
-                min_binding_size: None,
+        entries: &[
+            BindGroupLayoutEntry {
+                binding: 0,
+                visibility: ShaderStages::VERTEX | ShaderStages::FRAGMENT,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
             },
-            count: None,
-        }],
+            BindGroupLayoutEntry {
+                binding: 1,
+                visibility: ShaderStages::FRAGMENT,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+        ],
     })
 }
 
@@ -143,6 +171,7 @@ pub(super) fn create_mono_text_pipeline(
     glyph_layout: &BindGroupLayout,
     text_instance_layout: &BindGroupLayout,
     surface_format: TextureFormat,
+    pipeline_cache: Option<&wgpu::PipelineCache>,
 ) -> RenderPipeline {
     let shader = device.create_shader_module(ShaderModuleDescriptor {
         label: Some("nekoui_text_shader"),
@@ -180,7 +209,7 @@ pub(super) fn create_mono_text_pipeline(
         depth_stencil: None,
         multisample: MultisampleState::default(),
         multiview_mask: None,
-        cache: None,
+        cache: pipeline_cache,
     })
 }
 
@@ -190,6 +219,7 @@ pub(super) fn create_color_text_pipeline(
     glyph_layout: &BindGroupLayout,
     text_instance_layout: &BindGroupLayout,
     surface_format: TextureFormat,
+    pipeline_cache: Option<&wgpu::PipelineCache>,
 ) -> RenderPipeline {
     let shader = device.create_shader_module(ShaderModuleDescriptor {
         label: Some("nekoui_text_shader"),
@@ -227,6 +257,6 @@ pub(super) fn create_color_text_pipeline(
         depth_stencil: None,
         multisample: MultisampleState::default(),
         multiview_mask: None,
-        cache: None,
+        cache: pipeline_cache,
     })
 }

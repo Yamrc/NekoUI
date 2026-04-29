@@ -12,8 +12,8 @@ use cosmic_text::{Color as CosmicColor, SwashCache};
 use wgpu::util::{DeviceExt, StagingBelt};
 use wgpu::{
     BindGroup, BindGroupDescriptor, BindGroupEntry, BindGroupLayout, BindGroupLayoutDescriptor,
-    BindGroupLayoutEntry, BindingType, Buffer, BufferBindingType, ShaderStages,
-    TextureViewDescriptor,
+    BindGroupLayoutEntry, BindingType, Buffer, BufferBindingType, PipelineCacheDescriptor,
+    ShaderStages, TextureViewDescriptor,
 };
 use winit::window::Window as WinitWindow;
 
@@ -29,10 +29,10 @@ use self::pipelines::{
     create_rect_bind_group_layout, create_text_instance_bind_group_layout,
     create_text_texture_bind_group_layout,
 };
-use self::types::{ColorTextInstance, RectInstance, TextInstance, ViewUniform};
+use self::types::{ClipSlotInstance, ColorTextInstance, RectInstance, TextInstance, ViewUniform};
 use self::upload::{
-    create_rect_bind_group, create_storage_buffer, rebuild_storage, stage_write_bytes,
-    stage_write_pod_slice,
+    create_rect_bind_group, create_storage_buffer, rebuild_text_instance_storage,
+    stage_write_bytes, stage_write_pod_slice,
 };
 
 pub(crate) use self::types::{RenderOutcome, SurfaceLifecycleState, WindowRenderState};
@@ -63,18 +63,33 @@ pub struct RenderSystem {
     rect_instances: Vec<RectInstance>,
     mono_text_instances: Vec<TextInstance>,
     color_text_instances: Vec<ColorTextInstance>,
+    clip_slots: Vec<ClipSlotInstance>,
     gpu_batches: Vec<types::GpuBatch>,
     rect_storage_buffer: Buffer,
     mono_text_instance_buffer: Buffer,
     color_text_instance_buffer: Buffer,
+    clip_slot_buffer: Buffer,
     rect_instance_capacity: usize,
     mono_text_instance_capacity: usize,
     color_text_instance_capacity: usize,
+    clip_slot_capacity: usize,
     rect_low_usage_frames: u32,
     mono_text_low_usage_frames: u32,
     color_text_low_usage_frames: u32,
+    clip_slot_low_usage_frames: u32,
     current_surface_format: Option<wgpu::TextureFormat>,
+    pipeline_cache: Option<wgpu::PipelineCache>,
     buffer_epoch: u64,
+}
+
+impl Drop for RenderSystem {
+    fn drop(&mut self) {
+        self.staging_belt.recall();
+        let _ = self
+            .context
+            .device
+            .poll(wgpu::PollType::wait_indefinitely());
+    }
 }
 
 impl RenderSystem {
@@ -152,37 +167,65 @@ impl RenderSystem {
         let rect_instance_capacity = 64;
         let mono_text_instance_capacity = 256;
         let color_text_instance_capacity = 64;
+        let clip_slot_capacity = 64;
         let rect_storage_buffer = create_storage_buffer::<RectInstance>(
             &context.device,
             "nekoui_rect_instances",
             rect_instance_capacity,
         );
+        let clip_slot_buffer = create_storage_buffer::<ClipSlotInstance>(
+            &context.device,
+            "nekoui_clip_slots",
+            clip_slot_capacity,
+        );
         let rect_bind_group = create_rect_bind_group(
             &context.device,
             &rect_bind_group_layout,
             &rect_storage_buffer,
+            &clip_slot_buffer,
         );
-        let (mono_text_instance_buffer, mono_text_bind_group) = rebuild_storage::<TextInstance>(
-            &context.device,
-            &text_instance_bind_group_layout,
-            mono_text_instance_capacity,
-            "nekoui_mono_text_instances",
-            "nekoui_mono_text_bind_group",
-        );
-        let (color_text_instance_buffer, color_text_bind_group) =
-            rebuild_storage::<ColorTextInstance>(
+        let (mono_text_instance_buffer, mono_text_bind_group) =
+            rebuild_text_instance_storage::<TextInstance>(
                 &context.device,
                 &text_instance_bind_group_layout,
+                &clip_slot_buffer,
+                mono_text_instance_capacity,
+                "nekoui_mono_text_instances",
+                "nekoui_mono_text_bind_group",
+            );
+        let (color_text_instance_buffer, color_text_bind_group) =
+            rebuild_text_instance_storage::<ColorTextInstance>(
+                &context.device,
+                &text_instance_bind_group_layout,
+                &clip_slot_buffer,
                 color_text_instance_capacity,
                 "nekoui_color_text_instances",
                 "nekoui_color_text_bind_group",
             );
         let staging_device = context.device.clone();
+        let pipeline_cache = if context
+            .device
+            .features()
+            .contains(wgpu::Features::PIPELINE_CACHE)
+        {
+            Some(unsafe {
+                context
+                    .device
+                    .create_pipeline_cache(&PipelineCacheDescriptor {
+                        label: Some("nekoui_pipeline_cache"),
+                        data: None,
+                        fallback: true,
+                    })
+            })
+        } else {
+            None
+        };
         let rect_pipeline = pipelines::create_rect_pipeline(
             &context.device,
             &view_bind_group_layout,
             &rect_bind_group_layout,
             initial_surface_format,
+            pipeline_cache.as_ref(),
         );
         let mono_text_pipeline = pipelines::create_mono_text_pipeline(
             &context.device,
@@ -190,6 +233,7 @@ impl RenderSystem {
             &text_texture_bind_group_layout,
             &text_instance_bind_group_layout,
             initial_surface_format,
+            pipeline_cache.as_ref(),
         );
         let color_text_pipeline = pipelines::create_color_text_pipeline(
             &context.device,
@@ -197,6 +241,7 @@ impl RenderSystem {
             &text_texture_bind_group_layout,
             &text_instance_bind_group_layout,
             initial_surface_format,
+            pipeline_cache.as_ref(),
         );
 
         let mut render_system = Self {
@@ -220,17 +265,22 @@ impl RenderSystem {
             rect_instances: Vec::new(),
             mono_text_instances: Vec::new(),
             color_text_instances: Vec::new(),
+            clip_slots: Vec::new(),
             gpu_batches: Vec::new(),
             rect_storage_buffer,
             mono_text_instance_buffer,
             color_text_instance_buffer,
+            clip_slot_buffer,
             rect_instance_capacity,
             mono_text_instance_capacity,
             color_text_instance_capacity,
+            clip_slot_capacity,
             rect_low_usage_frames: 0,
             mono_text_low_usage_frames: 0,
             color_text_low_usage_frames: 0,
+            clip_slot_low_usage_frames: 0,
             current_surface_format: Some(initial_surface_format),
+            pipeline_cache,
             buffer_epoch: 1,
         };
         let render_state = render_system.create_window_state(surface, physical_size)?;
@@ -344,16 +394,19 @@ impl RenderSystem {
         self.configure_surface_if_needed(state)?;
 
         self.prepare_frame(state, scene, text_system, scale_factor as f32);
-        let prepared = state
-            .prepared_frame
-            .as_ref()
-            .expect("prepared frame must exist before rendering");
+        let Some(prepared) = state.prepared_frame.as_ref() else {
+            return Err(PlatformError::new(
+                "prepared frame missing after prepare_frame in render",
+            ));
+        };
         self.ensure_rect_capacity(prepared.rect_instances.len());
         self.ensure_mono_text_capacity(prepared.mono_text_instances.len());
         self.ensure_color_text_capacity(prepared.color_text_instances.len());
+        self.ensure_clip_slot_capacity(prepared.clip_slots.len());
         self.maybe_shrink_rect_capacity(prepared.rect_instances.len());
         self.maybe_shrink_mono_text_capacity(prepared.mono_text_instances.len());
         self.maybe_shrink_color_text_capacity(prepared.color_text_instances.len());
+        self.maybe_shrink_clip_slot_capacity(prepared.clip_slots.len());
         let uploads_required = state
             .prepared_frame
             .as_ref()
@@ -402,10 +455,11 @@ impl RenderSystem {
             }),
         );
         if uploads_required {
-            let prepared = state
-                .prepared_frame
-                .as_ref()
-                .expect("prepared frame must exist for uploads");
+            let Some(prepared) = state.prepared_frame.as_ref() else {
+                return Err(PlatformError::new(
+                    "prepared frame missing during upload stage",
+                ));
+            };
             stage_write_pod_slice(
                 &mut self.staging_belt,
                 &mut encoder,
@@ -423,6 +477,12 @@ impl RenderSystem {
                 &mut encoder,
                 &self.color_text_instance_buffer,
                 &prepared.color_text_instances,
+            );
+            stage_write_pod_slice(
+                &mut self.staging_belt,
+                &mut encoder,
+                &self.clip_slot_buffer,
+                &prepared.clip_slots,
             );
         }
         self.staging_belt.finish();
@@ -447,16 +507,18 @@ impl RenderSystem {
                 multiview_mask: None,
             });
 
-            let mut current_submit_state = None;
-            for batch in &*state
-                .prepared_frame
-                .as_ref()
-                .expect("prepared frame must exist during submit")
-                .gpu_batches
-            {
+            let mut current_submit_state: Option<types::BatchSubmitState> = None;
+            let Some(prepared) = state.prepared_frame.as_ref() else {
+                return Err(PlatformError::new(
+                    "prepared frame missing during submit stage",
+                ));
+            };
+            for batch in &*prepared.gpu_batches {
                 let submit_state = types::BatchSubmitState::from(batch);
-                if current_submit_state != Some(submit_state) {
-                    if current_submit_state.map(|state| state.pipeline_key)
+                if current_submit_state.as_ref() != Some(&submit_state) {
+                    if current_submit_state
+                        .as_ref()
+                        .map(|state| state.pipeline_key)
                         != Some(submit_state.pipeline_key)
                     {
                         match submit_state.pipeline_key {
@@ -478,7 +540,9 @@ impl RenderSystem {
                         }
                     }
 
-                    if current_submit_state.map(|state| state.texture_binding)
+                    if current_submit_state
+                        .as_ref()
+                        .map(|state| state.texture_binding)
                         != Some(submit_state.texture_binding)
                     {
                         match submit_state.texture_binding {
@@ -504,7 +568,7 @@ impl RenderSystem {
                         }
                         types::BatchClipPolicy::Bounds => {
                             let Some(scissor) = submit::clip_bounds_to_scissor_rect(
-                                submit_state.clip_stack,
+                                &submit_state.clip_stack,
                                 scale_factor as f32,
                                 state.config.width,
                                 state.config.height,
@@ -520,7 +584,7 @@ impl RenderSystem {
                         }
                     }
 
-                    current_submit_state = Some(submit_state);
+                    current_submit_state = Some(submit_state.clone());
                 }
                 match submit_state.effect_render_policy {
                     types::EffectRenderPolicy::Direct => {
@@ -614,21 +678,20 @@ mod tests {
     };
     use super::types::{
         BatchClipPolicy, BatchEffectPolicy, BatchSubmitState, ClipStack, ColorTextInstance,
-        EffectRenderPolicy, GpuBatch, PipelineKey, ScissorRect, TextInstance, TextureBindingKey,
+        EffectRenderPolicy, GpuBatch, PipelineKey, RectInstance, ScissorRect, TextInstance,
+        TextureBindingKey,
     };
     use crate::scene::{ClipShape, EffectClass, LayoutBox};
 
     fn rect_clip(bounds: LayoutBox) -> ClipStack {
-        ClipStack {
-            first: Some(ClipShape::Rect(bounds)),
-            second: None,
-        }
+        ClipStack::single(ClipShape::Rect(bounds))
     }
 
     #[test]
     fn text_storage_instances_match_wgsl_stride() {
-        assert_eq!(std::mem::size_of::<TextInstance>(), 112);
-        assert_eq!(std::mem::size_of::<ColorTextInstance>(), 112);
+        assert_eq!(std::mem::size_of::<RectInstance>(), 128);
+        assert_eq!(std::mem::size_of::<TextInstance>(), 64);
+        assert_eq!(std::mem::size_of::<ColorTextInstance>(), 64);
     }
 
     #[test]
@@ -828,7 +891,7 @@ mod tests {
     #[test]
     fn clip_bounds_to_scissor_rect_clamps_to_viewport() {
         let scissor = clip_bounds_to_scissor_rect(
-            rect_clip(LayoutBox {
+            &rect_clip(LayoutBox {
                 x: -4.25,
                 y: 2.25,
                 width: 20.75,

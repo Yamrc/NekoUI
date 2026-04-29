@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use wgpu::{
     Backends, Device, DeviceDescriptor, Features, Instance, InstanceDescriptor, Limits,
-    MemoryHints, PowerPreference, Queue, RequestAdapterOptions,
+    MemoryHints, PowerPreference, Queue, RequestAdapterOptions, Trace,
 };
 use winit::window::Window as WinitWindow;
 
@@ -37,13 +37,15 @@ impl WgpuContext {
         let required_limits = Limits::downlevel_defaults()
             .using_resolution(adapter.limits())
             .using_alignment(adapter.limits());
+        let supported_features = adapter.features();
+        let required_features = supported_features & Features::PIPELINE_CACHE;
         let (device, queue) = pollster::block_on(adapter.request_device(&DeviceDescriptor {
             label: Some("nekoui_device"),
-            required_features: Features::empty(),
+            required_features,
             required_limits,
             experimental_features: Default::default(),
             memory_hints: MemoryHints::MemoryUsage,
-            trace: Default::default(),
+            trace: Trace::Off,
         }))
         .map_err(|error| PlatformError::new(error.to_string()))?;
 

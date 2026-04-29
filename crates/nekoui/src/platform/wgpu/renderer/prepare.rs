@@ -1,20 +1,28 @@
 use std::sync::Arc;
 
 use cosmic_text::{CacheKey, SwashContent};
+use rustc_hash::FxHashMap;
+use smallvec::SmallVec;
 
 use crate::platform::wgpu::atlas::{AtlasEntry, GlyphAtlasKind};
-use crate::scene::{CompiledScene, LogicalBatch, MaterialClass, Primitive, SceneNode, SceneNodeId};
+use crate::scene::{CompiledScene, MaterialClass, Primitive, SceneNodeId};
 use crate::text_system::TextSystem;
 
 use super::{
     RenderSystem,
     submit::push_gpu_batch,
     types::{
-        ActiveBatch, ClipStack, ColorTextInstance, GpuBatch, LogicalBatchCursor, PipelineKey,
-        PreparedFrame, PreparedFrameKey, RectInstance, SceneWalkState, TextInstance,
-        TextPrimitiveParams, TextureBindingKey, pack_clip_stack,
+        ActiveBatch, ClipReference, ClipSlotInstance, ClipStack, ColorTextInstance, GpuBatch,
+        LogicalBatchCursor, PipelineKey, PreparedFrame, PreparedFrameKey, RectInstance,
+        SceneWalkState, TextInstance, TextPrimitiveParams, TextureBindingKey,
     },
 };
+
+struct PrepareContext<'a> {
+    text_system: &'a mut TextSystem,
+    scale_factor: f32,
+    clip_cache: FxHashMap<ClipStackKey, ClipReference>,
+}
 
 impl RenderSystem {
     pub(super) fn prepare_frame(
@@ -39,6 +47,7 @@ impl RenderSystem {
         self.rect_instances.clear();
         self.mono_text_instances.clear();
         self.color_text_instances.clear();
+        self.clip_slots.clear();
         self.gpu_batches.clear();
         self.collect_instances(scene, text_system, scale_factor);
         let final_key = self.prepared_frame_key(scene, scale_factor);
@@ -47,6 +56,7 @@ impl RenderSystem {
             rect_instances: Arc::new(std::mem::take(&mut self.rect_instances)),
             mono_text_instances: Arc::new(std::mem::take(&mut self.mono_text_instances)),
             color_text_instances: Arc::new(std::mem::take(&mut self.color_text_instances)),
+            clip_slots: Arc::new(std::mem::take(&mut self.clip_slots)),
             gpu_batches: Arc::new(std::mem::take(&mut self.gpu_batches)),
             uploaded_buffer_epoch: 0,
         });
@@ -58,10 +68,9 @@ impl RenderSystem {
         scale_factor: f32,
     ) -> PreparedFrameKey {
         PreparedFrameKey {
-            scene_arc_ptr: Arc::as_ptr(&scene.scene_nodes) as *const SceneNode as usize,
-            primitives_arc_ptr: Arc::as_ptr(&scene.primitives) as *const Primitive as usize,
-            logical_batches_arc_ptr: Arc::as_ptr(&scene.logical_batches) as *const LogicalBatch
-                as usize,
+            scene_nodes: scene.scene_nodes.clone(),
+            primitives: scene.primitives.clone(),
+            logical_batches: scene.logical_batches.clone(),
             scale_factor_bits: scale_factor.to_bits(),
             mono_atlas_generation: self.mono_atlas.generation(),
             color_atlas_generation: self.color_atlas.generation(),
@@ -82,11 +91,14 @@ impl RenderSystem {
             return;
         }
 
+        let mut prepare_context = PrepareContext {
+            text_system,
+            scale_factor,
+            clip_cache: FxHashMap::default(),
+        };
         let mut batch_cursor = LogicalBatchCursor::new(&scene.logical_batches);
         self.collect_node_instances(
             scene,
-            text_system,
-            scale_factor,
             SceneNodeId(0),
             SceneWalkState {
                 offset: [0.0, 0.0],
@@ -94,6 +106,7 @@ impl RenderSystem {
                 clip: ClipStack::default(),
             },
             &mut batch_cursor,
+            &mut prepare_context,
         );
     }
 
@@ -138,11 +151,10 @@ impl RenderSystem {
     fn collect_node_instances(
         &mut self,
         scene: &CompiledScene,
-        text_system: &mut TextSystem,
-        scale_factor: f32,
         node_id: SceneNodeId,
         parent_state: SceneWalkState,
         batch_cursor: &mut LogicalBatchCursor<'_>,
+        prepare_context: &mut PrepareContext<'_>,
     ) {
         let node = &scene.scene_nodes[node_id.0 as usize];
         let current_offset = [
@@ -157,7 +169,7 @@ impl RenderSystem {
         let current_state = SceneWalkState {
             offset: current_offset,
             opacity: current_opacity,
-            clip: combine_clip_stack(parent_state.clip, local_clip),
+            clip: combine_clip_stack(parent_state.clip.clone(), local_clip),
         };
 
         for primitive_index in node.primitive_range.as_range() {
@@ -172,20 +184,25 @@ impl RenderSystem {
                         width: rect_primitive.bounds.width,
                         height: rect_primitive.bounds.height,
                     };
-                    if !intersects_clip(rect_bounds, current_state.clip) {
+                    if !intersects_clip(rect_bounds, &current_state.clip) {
                         continue;
                     }
+                    let clip_reference = self.prepare_clip_reference(
+                        current_state.clip.clone(),
+                        prepare_context.scale_factor,
+                        &mut prepare_context.clip_cache,
+                    );
                     self.rect_instances.push(RectInstance::from_primitive(
                         rect_primitive,
                         rect_bounds,
-                        current_state.clip,
-                        scale_factor,
+                        clip_reference,
+                        prepare_context.scale_factor,
                         current_state.opacity,
                     ));
                     self.push_gpu_batch(
                         PipelineKey::Rect,
                         TextureBindingKey::None,
-                        current_state.clip,
+                        current_state.clip.clone(),
                         batch.effect_class,
                         start..self.rect_instances.len() as u32,
                     );
@@ -197,15 +214,14 @@ impl RenderSystem {
                 } => {
                     debug_assert_eq!(batch.material_class, MaterialClass::Text);
                     self.collect_text_primitive_instances(
-                        text_system,
-                        scale_factor,
                         TextPrimitiveParams {
                             bounds,
                             layout,
                             color,
-                            scene_state: current_state,
+                            scene_state: current_state.clone(),
                             batch,
                         },
+                        prepare_context,
                     );
                 }
             }
@@ -215,11 +231,10 @@ impl RenderSystem {
         while let Some(child_id) = child {
             self.collect_node_instances(
                 scene,
-                text_system,
-                scale_factor,
                 child_id,
-                current_state,
+                current_state.clone(),
                 batch_cursor,
+                prepare_context,
             );
             child = scene.scene_nodes[child_id.0 as usize].next_sibling;
         }
@@ -227,9 +242,8 @@ impl RenderSystem {
 
     fn collect_text_primitive_instances(
         &mut self,
-        text_system: &mut TextSystem,
-        scale_factor: f32,
         params: TextPrimitiveParams<'_>,
+        prepare_context: &mut PrepareContext<'_>,
     ) {
         let mut active_batch = None;
         let text_bounds = crate::scene::LayoutBox {
@@ -238,14 +252,19 @@ impl RenderSystem {
             width: params.bounds.width,
             height: params.bounds.height,
         };
-        if !intersects_clip(text_bounds, params.scene_state.clip) {
+        if !intersects_clip(text_bounds, &params.scene_state.clip) {
             return;
         }
         let scaled_clip = params
             .scene_state
             .clip
             .scissor_bounds()
-            .map(|clip| scale_layout_box(clip, scale_factor));
+            .map(|clip| scale_layout_box(clip, prepare_context.scale_factor));
+        let clip_reference = self.prepare_clip_reference(
+            params.scene_state.clip.clone(),
+            prepare_context.scale_factor,
+            &mut prepare_context.clip_cache,
+        );
 
         for run in &*params.layout.runs {
             for glyph in &run.glyphs {
@@ -253,57 +272,54 @@ impl RenderSystem {
                     glyph,
                     text_bounds,
                     params.layout.height,
-                    params.scene_state.clip,
+                    &params.scene_state.clip,
                 ) {
                     continue;
                 }
 
-                let physical = glyph.physical(
-                    (
-                        text_bounds.x * scale_factor,
-                        (text_bounds.y + run.baseline) * scale_factor,
-                    ),
-                    scale_factor,
-                );
-                let Some((atlas_kind, entry)) =
-                    self.ensure_glyph_entry(text_system, physical.cache_key)
-                else {
-                    continue;
-                };
-                let rect = crate::scene::LayoutBox {
-                    x: (physical.x + entry.placement_left) as f32,
-                    y: (physical.y - entry.placement_top) as f32,
-                    width: entry.width as f32,
-                    height: entry.height as f32,
-                };
-                if !intersects_clip_bounds(rect, scaled_clip) {
-                    continue;
-                }
-                let uv = crate::scene::LayoutBox {
-                    x: entry.uv_rect[0],
-                    y: entry.uv_rect[1],
-                    width: entry.uv_rect[2],
-                    height: entry.uv_rect[3],
-                };
-                let rect = [rect.x, rect.y, rect.width, rect.height];
-                let (clip_rect_0, clip_corner_radii_0, clip_rect_1, clip_corner_radii_1) =
-                    pack_clip_stack(params.scene_state.clip, scale_factor);
                 let glyph_color = glyph
                     .color_opt
                     .map(super::cosmic_to_style_color)
                     .unwrap_or(*params.color);
+                let physical = glyph.physical(
+                    (
+                        text_bounds.x * prepare_context.scale_factor,
+                        (text_bounds.y + run.baseline) * prepare_context.scale_factor,
+                    ),
+                    prepare_context.scale_factor,
+                );
+                let Some((atlas_kind, entry)) =
+                    self.ensure_glyph_entry(prepare_context.text_system, physical.cache_key)
+                else {
+                    continue;
+                };
 
                 match atlas_kind {
                     GlyphAtlasKind::Mono => {
+                        let rect = crate::scene::LayoutBox {
+                            x: (physical.x + entry.placement_left) as f32,
+                            y: (physical.y - entry.placement_top) as f32,
+                            width: entry.width as f32,
+                            height: entry.height as f32,
+                        };
+                        if !intersects_clip_bounds(rect, scaled_clip) {
+                            continue;
+                        }
+                        let uv = crate::scene::LayoutBox {
+                            x: entry.uv_rect[0],
+                            y: entry.uv_rect[1],
+                            width: entry.uv_rect[2],
+                            height: entry.uv_rect[3],
+                        };
                         self.start_or_switch_batch(
                             &mut active_batch,
                             PipelineKey::MonoText,
                             TextureBindingKey::MonoGlyphAtlas(entry.page_id),
-                            params.scene_state.clip,
+                            params.scene_state.clip.clone(),
                             params.batch.effect_class,
                         );
                         self.mono_text_instances.push(TextInstance {
-                            rect,
+                            rect: [rect.x, rect.y, rect.width, rect.height],
                             uv_rect: [uv.x, uv.y, uv.width, uv.height],
                             color: [
                                 glyph_color.r,
@@ -311,28 +327,55 @@ impl RenderSystem {
                                 glyph_color.b,
                                 glyph_color.a * params.scene_state.opacity,
                             ],
-                            clip_rect_0,
-                            clip_corner_radii_0,
-                            clip_rect_1,
-                            clip_corner_radii_1,
+                            clip_reference: clip_reference.into_raw(),
                         });
                     }
                     GlyphAtlasKind::Color => {
+                        let cache_key = color_glyph_cache_key(glyph, prepare_context.scale_factor);
+                        let Some((_, entry)) =
+                            self.ensure_glyph_entry(prepare_context.text_system, cache_key)
+                        else {
+                            continue;
+                        };
+                        let color_origin = color_glyph_origin(
+                            glyph,
+                            text_bounds,
+                            run.baseline,
+                            prepare_context.scale_factor,
+                        );
+                        let rect = crate::scene::LayoutBox {
+                            x: color_origin[0] + entry.placement_left as f32,
+                            y: color_origin[1] - entry.placement_top as f32,
+                            width: entry.width as f32,
+                            height: entry.height as f32,
+                        };
+                        if !intersects_clip_bounds(rect, scaled_clip) {
+                            continue;
+                        }
+                        let uv = crate::scene::LayoutBox {
+                            x: entry.uv_rect[0],
+                            y: entry.uv_rect[1],
+                            width: entry.uv_rect[2],
+                            height: entry.uv_rect[3],
+                        };
+                        let rect = [
+                            color_origin[0] + entry.placement_left as f32,
+                            color_origin[1] - entry.placement_top as f32,
+                            entry.width as f32,
+                            entry.height as f32,
+                        ];
                         self.start_or_switch_batch(
                             &mut active_batch,
                             PipelineKey::ColorText,
                             TextureBindingKey::ColorGlyphAtlas(entry.page_id),
-                            params.scene_state.clip,
+                            params.scene_state.clip.clone(),
                             params.batch.effect_class,
                         );
                         self.color_text_instances.push(ColorTextInstance {
                             rect,
                             uv_rect: [uv.x, uv.y, uv.width, uv.height],
                             alpha: [glyph_color.a * params.scene_state.opacity, 0.0, 0.0, 0.0],
-                            clip_rect_0,
-                            clip_corner_radii_0,
-                            clip_rect_1,
-                            clip_corner_radii_1,
+                            clip_reference: clip_reference.into_raw(),
                         });
                     }
                 }
@@ -341,7 +384,7 @@ impl RenderSystem {
 
         self.finish_active_batch(
             &mut active_batch,
-            params.scene_state.clip,
+            params.scene_state.clip.clone(),
             params.batch.effect_class,
         );
     }
@@ -411,9 +454,120 @@ impl RenderSystem {
             },
         );
     }
+
+    fn prepare_clip_reference(
+        &mut self,
+        clip_stack: ClipStack,
+        scale_factor: f32,
+        clip_cache: &mut FxHashMap<ClipStackKey, ClipReference>,
+    ) -> ClipReference {
+        if clip_stack.is_empty() {
+            return ClipReference::NONE;
+        }
+
+        let key = ClipStackKey::from_stack(&clip_stack);
+        if let Some(reference) = clip_cache.get(&key) {
+            return *reference;
+        }
+
+        let offset = self.clip_slots.len() as u32;
+        for clip_shape in clip_stack.iter() {
+            self.clip_slots
+                .push(ClipSlotInstance::from_shape(clip_shape, scale_factor));
+        }
+        let reference = ClipReference {
+            offset,
+            len: (self.clip_slots.len() as u32).saturating_sub(offset),
+        };
+        clip_cache.insert(key, reference);
+        reference
+    }
 }
 
-fn intersects_clip(rect: crate::scene::LayoutBox, clip: ClipStack) -> bool {
+fn color_glyph_cache_key(glyph: &cosmic_text::LayoutGlyph, scale_factor: f32) -> CacheKey {
+    let (cache_key, _, _) = CacheKey::new(
+        glyph.font_id,
+        glyph.glyph_id,
+        glyph.font_size * scale_factor,
+        (0.0, 0.0),
+        glyph.font_weight,
+        glyph.cache_key_flags,
+    );
+    cache_key
+}
+
+fn color_glyph_origin(
+    glyph: &cosmic_text::LayoutGlyph,
+    text_bounds: crate::scene::LayoutBox,
+    baseline: f32,
+    scale_factor: f32,
+) -> [f32; 2] {
+    let x_offset = glyph.font_size * glyph.x_offset;
+    let y_offset = glyph.font_size * glyph.y_offset;
+    let x = ((text_bounds.x + glyph.x + x_offset) * scale_factor).floor();
+    let y = ((text_bounds.y + baseline + glyph.y - y_offset) * scale_factor).floor();
+    [x, y]
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ClipStackKey {
+    slots: SmallVec<[PackedClipShapeKey; 4]>,
+}
+
+impl ClipStackKey {
+    fn from_stack(clip_stack: &ClipStack) -> Self {
+        Self {
+            slots: clip_stack
+                .iter()
+                .map(PackedClipShapeKey::from_shape)
+                .collect(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct PackedClipShapeKey {
+    kind: u8,
+    bounds: [u32; 4],
+    radii: [u32; 4],
+}
+
+impl PackedClipShapeKey {
+    fn from_shape(clip_shape: crate::scene::ClipShape) -> Self {
+        match clip_shape {
+            crate::scene::ClipShape::Rect(bounds) => Self {
+                kind: 0,
+                bounds: [
+                    bounds.x.to_bits(),
+                    bounds.y.to_bits(),
+                    bounds.width.to_bits(),
+                    bounds.height.to_bits(),
+                ],
+                radii: [0; 4],
+            },
+            crate::scene::ClipShape::RoundedRect {
+                bounds,
+                corner_radii,
+            } => Self {
+                kind: 1,
+                bounds: [
+                    bounds.x.to_bits(),
+                    bounds.y.to_bits(),
+                    bounds.width.to_bits(),
+                    bounds.height.to_bits(),
+                ],
+                radii: [
+                    corner_radii.top_left.to_bits(),
+                    corner_radii.top_right.to_bits(),
+                    corner_radii.bottom_right.to_bits(),
+                    corner_radii.bottom_left.to_bits(),
+                ],
+            },
+        }
+    }
+}
+
+fn intersects_clip(rect: crate::scene::LayoutBox, clip: &ClipStack) -> bool {
     if rect.width <= 0.0 || rect.height <= 0.0 {
         return false;
     }
@@ -439,7 +593,7 @@ fn logical_glyph_may_intersect_clip(
     glyph: &cosmic_text::LayoutGlyph,
     text_bounds: crate::scene::LayoutBox,
     layout_height: f32,
-    clip: ClipStack,
+    clip: &ClipStack,
 ) -> bool {
     let x_offset = glyph.font_size * glyph.x_offset;
     let left = text_bounds.x + glyph.x + x_offset.min(0.0);

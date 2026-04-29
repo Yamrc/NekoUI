@@ -3,8 +3,11 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use bytemuck::{Pod, Zeroable};
+use smallvec::SmallVec;
 
-use crate::scene::{ClipShape, EffectClass, LayoutBox, LogicalBatch, RectFill, RectPrimitive};
+use crate::scene::{
+    ClipShape, EffectClass, LayoutBox, LogicalBatch, Primitive, RectFill, RectPrimitive, SceneNode,
+};
 use crate::style::Color;
 
 #[repr(C)]
@@ -24,23 +27,18 @@ pub(super) struct RectInstance {
     pub(super) corner_radii: [f32; 4],
     pub(super) border_widths: [f32; 4],
     pub(super) border_color: [f32; 4],
-    pub(super) clip_rect_0: [f32; 4],
-    pub(super) clip_corner_radii_0: [f32; 4],
-    pub(super) clip_rect_1: [f32; 4],
-    pub(super) clip_corner_radii_1: [f32; 4],
+    pub(super) clip_reference: [u32; 4],
 }
 
 impl RectInstance {
     pub(super) fn from_primitive(
         primitive: &RectPrimitive,
         rect: LayoutBox,
-        clip_stack: ClipStack,
+        clip_reference: ClipReference,
         scale_factor: f32,
         opacity: f32,
     ) -> Self {
         let (fill_start_color, fill_end_color, fill_meta) = pack_rect_fill(primitive.fill, opacity);
-        let (clip_rect_0, clip_corner_radii_0, clip_rect_1, clip_corner_radii_1) =
-            pack_clip_stack(clip_stack, scale_factor);
         Self {
             rect: scale_layout_box(rect, scale_factor),
             fill_start_color,
@@ -52,10 +50,7 @@ impl RectInstance {
                 .border_color
                 .map(|border_color| pack_color(border_color, opacity))
                 .unwrap_or([0.0; 4]),
-            clip_rect_0,
-            clip_corner_radii_0,
-            clip_rect_1,
-            clip_corner_radii_1,
+            clip_reference: clip_reference.into_raw(),
         }
     }
 }
@@ -66,10 +61,7 @@ pub(super) struct TextInstance {
     pub(super) rect: [f32; 4],
     pub(super) uv_rect: [f32; 4],
     pub(super) color: [f32; 4],
-    pub(super) clip_rect_0: [f32; 4],
-    pub(super) clip_corner_radii_0: [f32; 4],
-    pub(super) clip_rect_1: [f32; 4],
-    pub(super) clip_corner_radii_1: [f32; 4],
+    pub(super) clip_reference: [u32; 4],
 }
 
 #[repr(C)]
@@ -78,10 +70,46 @@ pub(super) struct ColorTextInstance {
     pub(super) rect: [f32; 4],
     pub(super) uv_rect: [f32; 4],
     pub(super) alpha: [f32; 4],
-    pub(super) clip_rect_0: [f32; 4],
-    pub(super) clip_corner_radii_0: [f32; 4],
-    pub(super) clip_rect_1: [f32; 4],
-    pub(super) clip_corner_radii_1: [f32; 4],
+    pub(super) clip_reference: [u32; 4],
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub(super) struct ClipSlotInstance {
+    pub(super) clip_bounds: [f32; 4],
+    pub(super) clip_corner_radii: [f32; 4],
+}
+
+impl ClipSlotInstance {
+    pub(super) fn from_shape(clip_shape: ClipShape, scale_factor: f32) -> Self {
+        match clip_shape {
+            ClipShape::Rect(bounds) => Self {
+                clip_bounds: scale_layout_box(bounds, scale_factor),
+                clip_corner_radii: [0.0; 4],
+            },
+            ClipShape::RoundedRect {
+                bounds,
+                corner_radii,
+            } => Self {
+                clip_bounds: scale_layout_box(bounds, scale_factor),
+                clip_corner_radii: scale_corners(corner_radii, scale_factor),
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(super) struct ClipReference {
+    pub(super) offset: u32,
+    pub(super) len: u32,
+}
+
+impl ClipReference {
+    pub(super) const NONE: Self = Self { offset: 0, len: 0 };
+
+    pub(super) const fn into_raw(self) -> [u32; 4] {
+        [self.offset, self.len, 0, 0]
+    }
 }
 
 fn pack_rect_fill(fill: RectFill, opacity: f32) -> ([f32; 4], [f32; 4], [f32; 4]) {
@@ -102,86 +130,47 @@ fn pack_color(color: Color, opacity: f32) -> [f32; 4] {
     [color.r, color.g, color.b, color.a * opacity]
 }
 
-pub(super) fn pack_clip_stack(
-    clip_stack: ClipStack,
-    scale_factor: f32,
-) -> ([f32; 4], [f32; 4], [f32; 4], [f32; 4]) {
-    fn pack_slot(clip_shape: Option<ClipShape>, scale_factor: f32) -> ([f32; 4], [f32; 4]) {
-        let Some(clip_shape) = clip_shape else {
-            return ([0.0; 4], [0.0; 4]);
-        };
-
-        match clip_shape {
-            ClipShape::Rect(bounds) => (scale_layout_box(bounds, scale_factor), [0.0; 4]),
-            ClipShape::RoundedRect {
-                bounds,
-                corner_radii,
-            } => (
-                scale_layout_box(bounds, scale_factor),
-                scale_corners(corner_radii, scale_factor),
-            ),
-        }
-    }
-
-    let (clip_rect_0, clip_corner_radii_0) = pack_slot(clip_stack.first, scale_factor);
-    let (clip_rect_1, clip_corner_radii_1) = pack_slot(clip_stack.second, scale_factor);
-    (
-        clip_rect_0,
-        clip_corner_radii_0,
-        clip_rect_1,
-        clip_corner_radii_1,
-    )
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub(super) struct ClipStack {
-    pub(super) first: Option<ClipShape>,
-    pub(super) second: Option<ClipShape>,
+    slots: SmallVec<[ClipShape; 4]>,
 }
 
 impl ClipStack {
+    #[cfg(test)]
+    pub(super) fn single(clip_shape: ClipShape) -> Self {
+        let mut slots = SmallVec::new();
+        slots.push(clip_shape);
+        Self { slots }
+    }
+
     pub(super) fn push(mut self, clip_shape: ClipShape) -> Self {
-        if self.first == Some(clip_shape) || self.second == Some(clip_shape) {
+        if self.slots.contains(&clip_shape) {
             return self;
         }
-
-        if self.first.is_none() {
-            self.first = Some(clip_shape);
-            return self;
-        }
-
-        if self.second.is_none() {
-            self.second = Some(clip_shape);
-            return self;
-        }
-
-        let collapsed = self
-            .scissor_bounds()
-            .and_then(|bounds| intersect_layout_box(bounds, clip_shape.bounds()))
-            .map(ClipShape::Rect)
-            .unwrap_or(ClipShape::Rect(LayoutBox {
-                x: 0.0,
-                y: 0.0,
-                width: 0.0,
-                height: 0.0,
-            }));
-        Self {
-            first: Some(collapsed),
-            second: None,
-        }
+        self.slots.push(clip_shape);
+        self
     }
 
-    pub(super) fn scissor_bounds(self) -> Option<LayoutBox> {
-        match (self.first, self.second) {
-            (Some(first), Some(second)) => intersect_layout_box(first.bounds(), second.bounds()),
-            (Some(first), None) => Some(first.bounds()),
-            (None, Some(second)) => Some(second.bounds()),
-            (None, None) => None,
+    pub(super) fn scissor_bounds(&self) -> Option<LayoutBox> {
+        let mut bounds = None;
+        for clip_shape in &self.slots {
+            bounds = match bounds {
+                Some(current_bounds) => intersect_layout_box(current_bounds, clip_shape.bounds()),
+                None => Some(clip_shape.bounds()),
+            };
+            if bounds.is_none() {
+                break;
+            }
         }
+        bounds
     }
 
-    pub(super) fn is_empty(self) -> bool {
-        self.first.is_none() && self.second.is_none()
+    pub(super) fn is_empty(&self) -> bool {
+        self.slots.is_empty()
+    }
+
+    pub(super) fn iter(&self) -> impl Iterator<Item = ClipShape> + '_ {
+        self.slots.iter().copied()
     }
 }
 
@@ -230,15 +219,28 @@ fn scale_edges(edges: crate::style::EdgeWidths, scale_factor: f32) -> [f32; 4] {
     ]
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub(super) struct PreparedFrameKey {
-    pub(super) scene_arc_ptr: usize,
-    pub(super) primitives_arc_ptr: usize,
-    pub(super) logical_batches_arc_ptr: usize,
+    pub(super) scene_nodes: Arc<[SceneNode]>,
+    pub(super) primitives: Arc<[Primitive]>,
+    pub(super) logical_batches: Arc<[LogicalBatch]>,
     pub(super) scale_factor_bits: u32,
     pub(super) mono_atlas_generation: u64,
     pub(super) color_atlas_generation: u64,
 }
+
+impl PartialEq for PreparedFrameKey {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.scene_nodes, &other.scene_nodes)
+            && Arc::ptr_eq(&self.primitives, &other.primitives)
+            && Arc::ptr_eq(&self.logical_batches, &other.logical_batches)
+            && self.scale_factor_bits == other.scale_factor_bits
+            && self.mono_atlas_generation == other.mono_atlas_generation
+            && self.color_atlas_generation == other.color_atlas_generation
+    }
+}
+
+impl Eq for PreparedFrameKey {}
 
 #[derive(Debug, Clone)]
 pub(super) struct PreparedFrame {
@@ -246,6 +248,7 @@ pub(super) struct PreparedFrame {
     pub(super) rect_instances: Arc<Vec<RectInstance>>,
     pub(super) mono_text_instances: Arc<Vec<TextInstance>>,
     pub(super) color_text_instances: Arc<Vec<ColorTextInstance>>,
+    pub(super) clip_slots: Arc<Vec<ClipSlotInstance>>,
     pub(super) gpu_batches: Arc<Vec<GpuBatch>>,
     pub(super) uploaded_buffer_epoch: u64,
 }
@@ -307,7 +310,7 @@ pub(super) enum EffectRenderPolicy {
     InlineOpacity,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(super) struct BatchSubmitState {
     pub(super) pipeline_key: PipelineKey,
     pub(super) texture_binding: TextureBindingKey,
@@ -328,7 +331,7 @@ impl From<&GpuBatch> for BatchSubmitState {
             } else {
                 BatchClipPolicy::Bounds
             },
-            clip_stack: batch.clip_stack,
+            clip_stack: batch.clip_stack.clone(),
             effect_policy,
             effect_render_policy: super::submit::effect_render_policy(effect_policy),
         }
@@ -365,7 +368,7 @@ impl GpuBatchBuilder {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub(super) struct SceneWalkState {
     pub(super) offset: [f32; 2],
     pub(super) opacity: f32,

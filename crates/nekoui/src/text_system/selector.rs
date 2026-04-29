@@ -9,7 +9,7 @@ use cosmic_text::{
 use crate::SharedString;
 use crate::style::{FontFamily, FontStyle, FontWeight, ResolvedTextStyle, TextAlign};
 
-use super::{CLUSTER_FAMILY_INDEX_CACHE_LIMIT, FAMILY_CANDIDATE_CACHE_LIMIT, TextSystem};
+use super::TextSystem;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(super) struct FamilyCandidateCacheKey {
@@ -87,9 +87,6 @@ impl TextSystem {
 
         let selected = self.select_family_index_for_cluster(cluster, style);
 
-        if self.cluster_family_index_cache.len() >= CLUSTER_FAMILY_INDEX_CACHE_LIMIT {
-            self.cluster_family_index_cache.clear();
-        }
         self.cluster_family_index_cache.insert(cache_key, selected);
         selected
     }
@@ -123,8 +120,8 @@ impl TextSystem {
             font_weight: requested_weight,
             font_style: requested_style,
         };
-        if let Some(cached) = self.family_candidate_cache.get(&cache_key) {
-            return cached.clone();
+        if let Some(cached) = self.family_candidate_cache.get(&cache_key).cloned() {
+            return cached;
         }
 
         let candidates = collect_candidate_font_ids(
@@ -135,9 +132,6 @@ impl TextSystem {
         );
         let candidates: Arc<[CosmicFontId]> = Arc::from(candidates.into_boxed_slice());
 
-        if self.family_candidate_cache.len() >= FAMILY_CANDIDATE_CACHE_LIMIT {
-            self.family_candidate_cache.clear();
-        }
         self.family_candidate_cache
             .insert(cache_key, candidates.clone());
         candidates

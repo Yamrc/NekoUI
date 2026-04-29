@@ -127,14 +127,9 @@ impl GlyphAtlas {
         image: &cosmic_text::SwashImage,
     ) -> Option<AtlasEntry> {
         debug_assert_eq!(self.kind, GlyphAtlasKind::Color);
-        self.upload_impl(
-            device,
-            queue,
-            key,
-            image,
-            image.data.clone(),
-            image.placement.width * 4,
-        )
+        let mut bytes = image.data.clone();
+        premultiplied_rgba_to_straight_rgba(&mut bytes);
+        self.upload_impl(device, queue, key, image, bytes, image.placement.width * 4)
     }
 
     fn upload_impl(
@@ -405,9 +400,29 @@ fn eviction_page_ids(pages: &[AtlasPageState], max_pages: usize) -> Vec<u32> {
         .collect()
 }
 
+fn premultiplied_rgba_to_straight_rgba(bytes: &mut [u8]) {
+    for pixel in bytes.chunks_exact_mut(4) {
+        let alpha = u16::from(pixel[3]);
+        if alpha == 0 {
+            pixel[0] = 0;
+            pixel[1] = 0;
+            pixel[2] = 0;
+            continue;
+        }
+
+        let inv_alpha = 255.0 / alpha as f32;
+        pixel[0] = (pixel[0] as f32 * inv_alpha).clamp(0.0, 255.0) as u8;
+        pixel[1] = (pixel[1] as f32 * inv_alpha).clamp(0.0, 255.0) as u8;
+        pixel[2] = (pixel[2] as f32 * inv_alpha).clamp(0.0, 255.0) as u8;
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{AtlasPageState, GLYPH_ATLAS_BYTE_BUDGET, eviction_page_ids};
+    use super::{
+        AtlasPageState, GLYPH_ATLAS_BYTE_BUDGET, eviction_page_ids,
+        premultiplied_rgba_to_straight_rgba,
+    };
 
     #[test]
     fn eviction_prefers_oldest_unused_pages() {
@@ -477,5 +492,12 @@ mod tests {
         let budget_pages = (GLYPH_ATLAS_BYTE_BUDGET / page_bytes).max(1) as usize;
         assert_eq!(page_bytes, 16 * 1024 * 1024);
         assert_eq!(budget_pages.min(16), 4);
+    }
+
+    #[test]
+    fn premultiplied_rgba_normalization_restores_straight_alpha() {
+        let mut bytes = vec![128, 64, 32, 128, 0, 0, 0, 0];
+        premultiplied_rgba_to_straight_rgba(&mut bytes);
+        assert_eq!(bytes, vec![255, 127, 63, 128, 0, 0, 0, 0]);
     }
 }

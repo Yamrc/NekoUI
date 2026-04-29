@@ -1,3 +1,4 @@
+mod cache;
 mod selector;
 mod types;
 
@@ -6,27 +7,32 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use cosmic_text::{Align, Attrs, Buffer, FontSystem, Metrics, Shaping, Wrap};
-use rustc_hash::FxHashMap;
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::SharedString;
 use crate::style::{Absolute, Definite, ResolvedTextStyle, TextOverflow, WhiteSpace};
 
+use self::cache::AdaptiveLruCache;
 use self::selector::{
     ClusterFamilyIndexCacheKey, FamilyCandidateCacheKey, default_text_attrs, text_align, text_attrs,
 };
 pub use self::types::{SharedTextLayout, TextCacheStats, TextLayout, TextMeasureKey, TextRun};
 
 const DEFAULT_REM_SIZE_PX: f32 = 16.0;
-const FAMILY_CANDIDATE_CACHE_LIMIT: usize = 256;
-const CLUSTER_FAMILY_INDEX_CACHE_LIMIT: usize = 8_192;
+const MEASURE_CACHE_BASE_LIMIT: usize = 2_048;
+const MEASURE_CACHE_MAX_LIMIT: usize = 16_384;
+const FAMILY_CANDIDATE_CACHE_BASE_LIMIT: usize = 256;
+const FAMILY_CANDIDATE_CACHE_MAX_LIMIT: usize = 2_048;
+const CLUSTER_FAMILY_INDEX_CACHE_BASE_LIMIT: usize = 8_192;
+const CLUSTER_FAMILY_INDEX_CACHE_MAX_LIMIT: usize = 65_536;
 
 #[derive(Debug)]
 pub struct TextSystem {
     font_system: FontSystem,
-    measure_cache: FxHashMap<TextMeasureKey, SharedTextLayout>,
-    family_candidate_cache: FxHashMap<FamilyCandidateCacheKey, Arc<[cosmic_text::fontdb::ID]>>,
-    cluster_family_index_cache: FxHashMap<ClusterFamilyIndexCacheKey, Option<usize>>,
+    measure_cache: AdaptiveLruCache<TextMeasureKey, SharedTextLayout>,
+    family_candidate_cache:
+        AdaptiveLruCache<FamilyCandidateCacheKey, Arc<[cosmic_text::fontdb::ID]>>,
+    cluster_family_index_cache: AdaptiveLruCache<ClusterFamilyIndexCacheKey, Option<usize>>,
     cache_stats: TextCacheStats,
 }
 
@@ -34,9 +40,15 @@ impl TextSystem {
     pub(crate) fn new() -> Self {
         Self {
             font_system: FontSystem::new(),
-            measure_cache: FxHashMap::default(),
-            family_candidate_cache: FxHashMap::default(),
-            cluster_family_index_cache: FxHashMap::default(),
+            measure_cache: AdaptiveLruCache::new(MEASURE_CACHE_BASE_LIMIT, MEASURE_CACHE_MAX_LIMIT),
+            family_candidate_cache: AdaptiveLruCache::new(
+                FAMILY_CANDIDATE_CACHE_BASE_LIMIT,
+                FAMILY_CANDIDATE_CACHE_MAX_LIMIT,
+            ),
+            cluster_family_index_cache: AdaptiveLruCache::new(
+                CLUSTER_FAMILY_INDEX_CACHE_BASE_LIMIT,
+                CLUSTER_FAMILY_INDEX_CACHE_MAX_LIMIT,
+            ),
             cache_stats: TextCacheStats::default(),
         }
     }
@@ -49,9 +61,9 @@ impl TextSystem {
     ) -> SharedTextLayout {
         let key = measure_key(text, style, width);
 
-        if let Some(cached) = self.measure_cache.get(&key) {
+        if let Some(cached) = self.measure_cache.get(&key).cloned() {
             self.cache_stats.hits += 1;
-            return cached.clone();
+            return cached;
         }
 
         self.cache_stats.misses += 1;

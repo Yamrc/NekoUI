@@ -8,14 +8,19 @@ struct TextInstance {
     rect: vec4<f32>,
     uv_rect: vec4<f32>,
     payload: vec4<f32>,
-    clip_rect_0: vec4<f32>,
-    clip_corner_radii_0: vec4<f32>,
-    clip_rect_1: vec4<f32>,
-    clip_corner_radii_1: vec4<f32>,
+    clip_reference: vec4<u32>,
 };
 
 @group(2) @binding(0)
 var<storage, read> b_text: array<TextInstance>;
+
+struct ClipSlot {
+    clip_bounds: vec4<f32>,
+    clip_corner_radii: vec4<f32>,
+};
+
+@group(2) @binding(1)
+var<storage, read> b_clips: array<ClipSlot>;
 
 struct MonoVsOut {
     @builtin(position) position: vec4<f32>,
@@ -32,6 +37,20 @@ struct ColorVsOut {
     @location(2) point: vec2<f32>,
     @location(3) @interpolate(flat) text_index: u32,
 };
+
+fn clip_stack_alpha_for(clip_reference: vec4<u32>, point: vec2<f32>) -> f32 {
+    var alpha = 1.0;
+    var clip_index = 0u;
+    loop {
+        if clip_index >= clip_reference.y {
+            break;
+        }
+        let clip_slot = b_clips[clip_reference.x + clip_index];
+        alpha *= clip_slot_alpha(clip_slot.clip_bounds, clip_slot.clip_corner_radii, point);
+        clip_index += 1u;
+    }
+    return alpha;
+}
 
 @vertex
 fn vs_mono(
@@ -54,13 +73,7 @@ fn vs_mono(
 fn fs_mono(in: MonoVsOut) -> @location(0) vec4<f32> {
     let instance = b_text[in.text_index];
     let sampled_alpha = textureSample(atlas_texture, atlas_sampler, in.uv).r;
-    let clip_alpha_value = clip_stack_alpha(
-        instance.clip_rect_0,
-        instance.clip_corner_radii_0,
-        instance.clip_rect_1,
-        instance.clip_corner_radii_1,
-        in.point,
-    );
+    let clip_alpha_value = clip_stack_alpha_for(instance.clip_reference, in.point);
     return vec4<f32>(in.color.rgb, sampled_alpha * in.color.a * clip_alpha_value);
 }
 
@@ -85,12 +98,6 @@ fn vs_color(
 fn fs_color(in: ColorVsOut) -> @location(0) vec4<f32> {
     let instance = b_text[in.text_index];
     let sampled = textureSample(atlas_texture, atlas_sampler, in.uv);
-    let clip_alpha_value = clip_stack_alpha(
-        instance.clip_rect_0,
-        instance.clip_corner_radii_0,
-        instance.clip_rect_1,
-        instance.clip_corner_radii_1,
-        in.point,
-    );
+    let clip_alpha_value = clip_stack_alpha_for(instance.clip_reference, in.point);
     return vec4<f32>(sampled.rgb, sampled.a * in.alpha * clip_alpha_value);
 }

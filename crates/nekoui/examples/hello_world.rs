@@ -25,7 +25,7 @@ impl Render for HelloWorld {
                     .rounded(8.0)
                     .font_family(["CaskaydiaCove Nerd Font", "Noto Sans SC"])
                     .child(
-                        text(" Hello world! 我的项目不可能这么稳定！")
+                        text("Hello world! 我的项目不可能这么稳定！")
                             .font_size(px(32.0))
                             .text_color(Color::rgb(0xFFFFFF)),
                     ),

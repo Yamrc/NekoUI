@@ -26,7 +26,7 @@ pub(super) fn push_gpu_batch(batches: &mut Vec<GpuBatch>, batch: GpuBatch) {
 }
 
 pub(super) fn clip_bounds_to_scissor_rect(
-    clip_stack: super::types::ClipStack,
+    clip_stack: &super::types::ClipStack,
     scale_factor: f32,
     viewport_width: u32,
     viewport_height: u32,
