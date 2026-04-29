@@ -1,11 +1,12 @@
+mod frame_package;
 mod pipelines;
 mod prepare;
 mod submit;
+mod surface_controller;
 mod types;
 mod upload;
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use bytemuck::bytes_of;
 use cosmic_text::{Color as CosmicColor, SwashCache};
@@ -20,7 +21,6 @@ use winit::window::Window as WinitWindow;
 use crate::error::PlatformError;
 use crate::platform::wgpu::atlas::GlyphAtlas;
 use crate::platform::wgpu::context::WgpuContext;
-use crate::scene::CompiledScene;
 use crate::style::Color;
 use crate::text_system::TextSystem;
 use crate::window::WindowSize;
@@ -29,18 +29,20 @@ use self::pipelines::{
     create_rect_bind_group_layout, create_text_instance_bind_group_layout,
     create_text_texture_bind_group_layout,
 };
+use self::surface_controller::surface_extent_for;
 use self::types::{ClipSlotInstance, ColorTextInstance, RectInstance, TextInstance, ViewUniform};
 use self::upload::{
     create_rect_bind_group, create_storage_buffer, rebuild_text_instance_storage,
     stage_write_bytes, stage_write_pod_slice,
 };
 
-pub(crate) use self::types::{RenderOutcome, SurfaceLifecycleState, WindowRenderState};
+pub(crate) use self::types::{RenderOutcome, WindowRenderState};
+pub(crate) use frame_package::RenderFramePackage;
+pub(crate) use surface_controller::{SurfaceController, SurfaceLifecycleState};
 
 const ATLAS_SIZE: u32 = 2048;
 const STAGING_BELT_CHUNK_SIZE: u64 = 64 * 1024;
 const SHRINK_IDLE_FRAME_THRESHOLD: u32 = 90;
-const RESIZE_STABILITY_GRACE: Duration = Duration::from_millis(40);
 
 pub struct RenderSystem {
     context: WgpuContext,
@@ -97,7 +99,7 @@ impl RenderSystem {
         window: Arc<WinitWindow>,
         physical_size: WindowSize,
     ) -> Result<(Self, WindowRenderState), PlatformError> {
-        let (context, surface) = WgpuContext::new(window)?;
+        let (context, surface) = WgpuContext::new(window.clone())?;
 
         let view_bind_group_layout =
             context
@@ -152,10 +154,7 @@ impl RenderSystem {
             crate::platform::wgpu::atlas::GlyphAtlasKind::Color,
             ATLAS_SIZE.min(context.max_texture_size),
         )?;
-        let initial_extent = WindowSize::new(
-            physical_size.width.max(1).min(context.max_texture_size),
-            physical_size.height.max(1).min(context.max_texture_size),
-        );
+        let initial_extent = surface_extent_for(physical_size, context.max_texture_size);
         let initial_surface_format = surface
             .get_default_config(
                 &context.adapter,
@@ -283,7 +282,7 @@ impl RenderSystem {
             pipeline_cache,
             buffer_epoch: 1,
         };
-        let render_state = render_system.create_window_state(surface, physical_size)?;
+        let render_state = render_system.create_window_state(window, surface, physical_size)?;
         Ok((render_system, render_state))
     }
 
@@ -296,11 +295,12 @@ impl RenderSystem {
 
     pub fn create_window_state(
         &mut self,
+        window: Arc<WinitWindow>,
         surface: wgpu::Surface<'static>,
         physical_size: WindowSize,
     ) -> Result<WindowRenderState, PlatformError> {
         let current_size = physical_size;
-        let physical_size = self.surface_extent_for(physical_size);
+        let physical_size = surface_extent_for(physical_size, self.context.max_texture_size);
         let mut config = surface
             .get_default_config(
                 &self.context.adapter,
@@ -312,88 +312,46 @@ impl RenderSystem {
         surface.configure(&self.context.device, &config);
         self.ensure_pipelines_for_format(config.format);
         Ok(WindowRenderState {
-            surface,
-            config,
-            current_size,
-            surface_state: SurfaceLifecycleState::Stable,
+            surface: SurfaceController::new(window, surface, config, current_size),
             prepared_frame: None,
         })
     }
 
     pub fn note_surface_resize(&self, state: &mut WindowRenderState, physical_size: WindowSize) {
-        state.current_size = physical_size;
-        if physical_size.width == 0 || physical_size.height == 0 {
-            state.surface_state = SurfaceLifecycleState::Unavailable;
-            return;
-        }
-
-        let peak_area = match state.surface_state {
-            SurfaceLifecycleState::ResizePending {
-                session_peak_area, ..
-            } => session_peak_area.max(physical_size.width.saturating_mul(physical_size.height)),
-            _ => physical_size.width.saturating_mul(physical_size.height),
-        };
-        state.surface_state = SurfaceLifecycleState::ResizePending {
-            requested: physical_size,
-            stable_after: Instant::now() + RESIZE_STABILITY_GRACE,
-            session_peak_area: peak_area,
-        };
+        state.surface.note_resize(physical_size);
     }
 
     pub fn note_surface_occlusion(&self, state: &mut WindowRenderState, occluded: bool) {
-        if occluded {
-            state.surface_state = SurfaceLifecycleState::Occluded;
-            return;
-        }
-
-        if state.current_size.width == 0 || state.current_size.height == 0 {
-            state.surface_state = SurfaceLifecycleState::Unavailable;
-            return;
-        }
-
-        let target_size = self.surface_extent_for(state.current_size);
-        state.surface_state = if state.config.width == target_size.width
-            && state.config.height == target_size.height
-        {
-            SurfaceLifecycleState::Stable
-        } else {
-            SurfaceLifecycleState::ResizePending {
-                requested: state.current_size,
-                stable_after: Instant::now() + RESIZE_STABILITY_GRACE,
-                session_peak_area: state
-                    .current_size
-                    .width
-                    .saturating_mul(state.current_size.height),
-            }
-        };
+        state
+            .surface
+            .note_occlusion(occluded, self.context.max_texture_size);
     }
 
-    pub fn recreate_surface(
-        &mut self,
-        state: &mut WindowRenderState,
-        window: Arc<WinitWindow>,
-    ) -> Result<(), PlatformError> {
-        state.surface = self.context.create_surface_for_window(window)?;
-        self.note_surface_resize(state, state.current_size);
-        Ok(())
+    pub fn recreate_surface(&mut self, state: &mut WindowRenderState) -> Result<(), PlatformError> {
+        state.surface.recreate(&self.context)
     }
 
     pub fn render(
         &mut self,
         state: &mut WindowRenderState,
-        scene: &CompiledScene,
+        frame: RenderFramePackage<'_>,
         text_system: &mut TextSystem,
-        window: &WinitWindow,
-        scale_factor: f64,
     ) -> Result<RenderOutcome, PlatformError> {
-        if state.current_size.width == 0 || state.current_size.height == 0 {
-            state.surface_state = SurfaceLifecycleState::Unavailable;
+        if state.surface.target_size.width == 0 || state.surface.target_size.height == 0 {
+            state.surface.surface_state = SurfaceLifecycleState::Unavailable;
             return Ok(RenderOutcome::Unavailable);
         }
 
-        self.configure_surface_if_needed(state)?;
+        if !frame.is_current() {
+            return Ok(RenderOutcome::Unavailable);
+        }
 
-        self.prepare_frame(state, scene, text_system, scale_factor as f32);
+        let reconfigured = self.configure_surface_if_needed(state)?;
+        if !reconfigured && !frame.matches_surface_generation(state.surface.config_generation) {
+            return Ok(RenderOutcome::Reconfigure);
+        }
+
+        self.prepare_frame(state, frame.scene, text_system, frame.scale_factor as f32);
         let Some(prepared) = state.prepared_frame.as_ref() else {
             return Err(PlatformError::new(
                 "prepared frame missing after prepare_frame in render",
@@ -412,32 +370,35 @@ impl RenderSystem {
             .as_ref()
             .is_some_and(|prepared| prepared.uploaded_buffer_epoch != self.buffer_epoch);
 
-        let (frame, presented_suboptimal) = match state.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(frame) => (frame, false),
-            wgpu::CurrentSurfaceTexture::Suboptimal(frame) => (frame, true),
-            wgpu::CurrentSurfaceTexture::Outdated => {
-                self.note_surface_resize(state, state.current_size);
-                return Ok(RenderOutcome::Reconfigure);
-            }
-            wgpu::CurrentSurfaceTexture::Lost => {
-                state.surface_state = SurfaceLifecycleState::Lost;
-                return Ok(RenderOutcome::RecreateSurface);
-            }
-            wgpu::CurrentSurfaceTexture::Timeout => {
-                return Ok(RenderOutcome::Unavailable);
-            }
-            wgpu::CurrentSurfaceTexture::Occluded => {
-                state.surface_state = SurfaceLifecycleState::Occluded;
-                return Ok(RenderOutcome::Unavailable);
-            }
-            wgpu::CurrentSurfaceTexture::Validation => {
-                return Err(PlatformError::new(
-                    "surface validation failed during get_current_texture",
-                ));
-            }
-        };
+        let (surface_texture, presented_suboptimal) =
+            match state.surface.surface.get_current_texture() {
+                wgpu::CurrentSurfaceTexture::Success(frame) => (frame, false),
+                wgpu::CurrentSurfaceTexture::Suboptimal(frame) => (frame, true),
+                wgpu::CurrentSurfaceTexture::Outdated => {
+                    self.note_surface_resize(state, state.surface.target_size);
+                    return Ok(RenderOutcome::Reconfigure);
+                }
+                wgpu::CurrentSurfaceTexture::Lost => {
+                    state.surface.surface_state = SurfaceLifecycleState::Lost;
+                    return Ok(RenderOutcome::RecreateSurface);
+                }
+                wgpu::CurrentSurfaceTexture::Timeout => {
+                    return Ok(RenderOutcome::Unavailable);
+                }
+                wgpu::CurrentSurfaceTexture::Occluded => {
+                    state.surface.surface_state = SurfaceLifecycleState::Occluded;
+                    return Ok(RenderOutcome::Unavailable);
+                }
+                wgpu::CurrentSurfaceTexture::Validation => {
+                    return Err(PlatformError::new(
+                        "surface validation failed during get_current_texture",
+                    ));
+                }
+            };
 
-        let view = frame.texture.create_view(&TextureViewDescriptor::default());
+        let view = surface_texture
+            .texture
+            .create_view(&TextureViewDescriptor::default());
         let mut encoder =
             self.context
                 .device
@@ -450,7 +411,10 @@ impl RenderSystem {
             &mut encoder,
             &self.view_buffer,
             bytes_of(&ViewUniform {
-                viewport: [state.config.width as f32, state.config.height as f32],
+                viewport: [
+                    state.surface.config.width as f32,
+                    state.surface.config.height as f32,
+                ],
                 _pad: [0.0; 2],
             }),
         );
@@ -496,7 +460,10 @@ impl RenderSystem {
                     depth_slice: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(color_to_wgpu(
-                            scene.clear_color.unwrap_or(Color::rgba(1.0, 1.0, 1.0, 1.0)),
+                            frame
+                                .scene
+                                .clear_color
+                                .unwrap_or(Color::rgba(1.0, 1.0, 1.0, 1.0)),
                         )),
                         store: wgpu::StoreOp::Store,
                     },
@@ -564,14 +531,19 @@ impl RenderSystem {
 
                     match submit_state.clip_policy {
                         types::BatchClipPolicy::None => {
-                            pass.set_scissor_rect(0, 0, state.config.width, state.config.height);
+                            pass.set_scissor_rect(
+                                0,
+                                0,
+                                state.surface.config.width,
+                                state.surface.config.height,
+                            );
                         }
                         types::BatchClipPolicy::Bounds => {
                             let Some(scissor) = submit::clip_bounds_to_scissor_rect(
                                 &submit_state.clip_stack,
-                                scale_factor as f32,
-                                state.config.width,
-                                state.config.height,
+                                frame.scale_factor as f32,
+                                state.surface.config.width,
+                                state.surface.config.height,
                             ) else {
                                 continue;
                             };
@@ -600,15 +572,15 @@ impl RenderSystem {
             }
         }
 
-        window.pre_present_notify();
+        state.surface.window.pre_present_notify();
         self.context.queue.submit(Some(encoder.finish()));
         self.staging_belt.recall();
         if uploads_required && let Some(prepared) = state.prepared_frame.as_mut() {
             prepared.uploaded_buffer_epoch = self.buffer_epoch;
         }
-        frame.present();
+        surface_texture.present();
         if presented_suboptimal {
-            self.note_surface_resize(state, state.current_size);
+            self.note_surface_resize(state, state.surface.target_size);
             Ok(RenderOutcome::PresentedSuboptimal)
         } else {
             Ok(RenderOutcome::Presented)
@@ -618,38 +590,15 @@ impl RenderSystem {
     fn configure_surface_if_needed(
         &mut self,
         state: &mut WindowRenderState,
-    ) -> Result<(), PlatformError> {
-        let target_size = self.surface_extent_for(state.current_size);
-        let configured_matches =
-            state.config.width == target_size.width && state.config.height == target_size.height;
-
-        let needs_configure = match state.surface_state {
-            SurfaceLifecycleState::ResizePending { .. } | SurfaceLifecycleState::Lost => true,
-            SurfaceLifecycleState::Occluded | SurfaceLifecycleState::Unavailable => {
-                !configured_matches
-            }
-            SurfaceLifecycleState::Stable => !configured_matches,
-        };
-
-        if !needs_configure {
-            state.surface_state = SurfaceLifecycleState::Stable;
-            return Ok(());
+    ) -> Result<bool, PlatformError> {
+        if !state
+            .surface
+            .configure_if_needed(&self.context.device, self.context.max_texture_size)
+        {
+            return Ok(false);
         }
-
-        state.config.width = target_size.width;
-        state.config.height = target_size.height;
-        state.surface.configure(&self.context.device, &state.config);
-        self.ensure_pipelines_for_format(state.config.format);
-        state.surface_state = SurfaceLifecycleState::Stable;
-        Ok(())
-    }
-
-    fn surface_extent_for(&self, physical_size: WindowSize) -> WindowSize {
-        let max = self.context.max_texture_size;
-        WindowSize::new(
-            physical_size.width.max(1).min(max),
-            physical_size.height.max(1).min(max),
-        )
+        self.ensure_pipelines_for_format(state.surface.config.format);
+        Ok(true)
     }
 }
 

@@ -1,6 +1,5 @@
 use std::ops::Range;
 use std::sync::Arc;
-use std::time::Instant;
 
 use bytemuck::{Pod, Zeroable};
 use smallvec::SmallVec;
@@ -416,23 +415,13 @@ pub(crate) enum RenderOutcome {
     Unavailable,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SurfaceLifecycleState {
-    Stable,
-    ResizePending {
-        requested: crate::window::WindowSize,
-        stable_after: Instant,
-        session_peak_area: u32,
-    },
-    Occluded,
-    Lost,
-    Unavailable,
+pub(crate) struct WindowRenderState {
+    pub(super) surface: super::SurfaceController,
+    pub(super) prepared_frame: Option<PreparedFrame>,
 }
 
-pub(crate) struct WindowRenderState {
-    pub(super) surface: wgpu::Surface<'static>,
-    pub(super) config: wgpu::SurfaceConfiguration,
-    pub(super) current_size: crate::window::WindowSize,
-    pub(super) surface_state: SurfaceLifecycleState,
-    pub(super) prepared_frame: Option<PreparedFrame>,
+impl WindowRenderState {
+    pub(crate) fn surface_generation(&self) -> u64 {
+        self.surface.config_generation
+    }
 }

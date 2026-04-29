@@ -10,7 +10,7 @@ use winit::window::WindowId as WinitWindowId;
 
 use crate::app::{App, AppContext, LastWindowBehavior};
 use crate::error::{Error, PlatformError};
-use crate::platform::wgpu::{RenderOutcome, RenderSystem};
+use crate::platform::wgpu::{RenderFramePackage, RenderOutcome, RenderSystem};
 #[cfg(target_os = "linux")]
 use crate::platform::window::native::linux::{
     backend_kind as linux_backend_kind, begin_client_decorations_resize,
@@ -142,7 +142,11 @@ impl AppRuntime {
 
         let render_state = if let Some(render_system) = self.render_system.as_mut() {
             let surface = render_system.create_surface_for_window(native_window.clone())?;
-            render_system.create_window_state(surface, metrics.physical_size)?
+            render_system.create_window_state(
+                native_window.clone(),
+                surface,
+                metrics.physical_size,
+            )?
         } else {
             let (render_system, render_state) =
                 RenderSystem::new(native_window.clone(), metrics.physical_size)?;
@@ -570,12 +574,17 @@ impl ApplicationHandler<RunnerEvent> for AppRuntime {
                     runtime_window.frame_scheduler.begin_redraw();
                     refresh_window_native_state(runtime_window, Some(render_system));
                     sync_window_scene_to_latest_metrics(runtime_window, text_system);
+                    let frame_package = RenderFramePackage {
+                        scene: &runtime_window.compiled_scene,
+                        metrics_generation: runtime_window.generation_state.metrics_generation,
+                        scene_generation: runtime_window.generation_state.scene_generation,
+                        target_surface_generation: runtime_window.render_state.surface_generation(),
+                        scale_factor: runtime_window.public_window.scale_factor(),
+                    };
                     match render_system.render(
                         &mut runtime_window.render_state,
-                        &runtime_window.compiled_scene,
+                        frame_package,
                         text_system,
-                        &runtime_window.native_window,
-                        runtime_window.public_window.scale_factor(),
                     ) {
                         Ok(RenderOutcome::Presented) => {
                             runtime_window.generation_state.mark_presented();
@@ -592,10 +601,8 @@ impl ApplicationHandler<RunnerEvent> for AppRuntime {
                             mark_window_pending(runtime_window, FrameReasonMask::SURFACE);
                         }
                         Ok(RenderOutcome::RecreateSurface) => {
-                            let _ = render_system.recreate_surface(
-                                &mut runtime_window.render_state,
-                                runtime_window.native_window.clone(),
-                            );
+                            let _ =
+                                render_system.recreate_surface(&mut runtime_window.render_state);
                             mark_window_pending(runtime_window, FrameReasonMask::SURFACE);
                         }
                         Ok(RenderOutcome::Unavailable) => {
