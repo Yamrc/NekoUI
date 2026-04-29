@@ -2,6 +2,7 @@ mod color;
 pub mod geometry;
 mod layout;
 mod paint;
+mod runtime;
 mod text;
 
 pub use color::{Color, Oklch};
@@ -14,6 +15,9 @@ pub use layout::{
     LayoutStyle, Overflow,
 };
 pub use paint::{Background, BackgroundFill, Border, LinearGradient, PaintStyle, gradient};
+pub(crate) use runtime::{
+    StyleChange, diff_div_style, diff_text_style, div_style_to_taffy, text_style_to_taffy,
+};
 pub use text::{
     FontFamily, FontStyle, FontWeight, IntoFontFamilies, ResolvedTextStyle, TextAlign,
     TextOverflow, TextStyle, WhiteSpace,
