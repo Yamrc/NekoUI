@@ -25,9 +25,7 @@ pub use style::{
     Point, Px, Rem, ResolvedStyle, ResolvedTextStyle, Size, Style, TextAlign, TextOverflow,
     TextStyle, WhiteSpace, bounds, gradient, percent, point, px, rem, size,
 };
-pub use text_system::{
-    SharedTextLayout, TextCacheStats, TextLayout, TextMeasureKey, TextRun, TextSystem,
-};
+pub use text_system::{TextCacheStats, TextLayout, TextMeasureKey, TextRun, TextSystem};
 pub use window::{
     DisplayId, DisplayInfo, DisplaySelector, WindowAppearance, WindowBehavior, WindowGeometry,
     WindowGeometryPatch, WindowHandle, WindowId, WindowInfo, WindowOptions, WindowPlacement,

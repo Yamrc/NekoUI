@@ -1,12 +1,11 @@
 use std::sync::Arc;
 
-use cosmic_text::{CacheKey, SwashContent};
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 
-use crate::platform::wgpu::atlas::{AtlasEntry, GlyphAtlasKind};
+use crate::platform::wgpu::atlas::{AtlasEntry, GlyphAtlasKind, GlyphBitmapUpload};
 use crate::scene::{CompiledScene, MaterialClass, Primitive, SceneNodeId};
-use crate::text_system::TextSystem;
+use crate::text_system::{RasterGlyphFormat, TextSystem};
 
 use super::{
     RenderSystem,
@@ -113,7 +112,7 @@ impl RenderSystem {
     pub(super) fn ensure_glyph_entry(
         &mut self,
         text_system: &mut TextSystem,
-        cache_key: CacheKey,
+        cache_key: cosmic_text::CacheKey,
     ) -> Option<(GlyphAtlasKind, AtlasEntry)> {
         if let Some(entry) = self.mono_atlas.get(&cache_key) {
             return Some((GlyphAtlasKind::Mono, entry));
@@ -122,20 +121,38 @@ impl RenderSystem {
             return Some((GlyphAtlasKind::Color, entry));
         }
 
-        let image = self
-            .swash_cache
-            .get_image(text_system.font_system_mut(), cache_key)
-            .as_ref()?
-            .clone();
+        let raster = text_system.raster_glyph(cache_key)?;
 
-        match image.content {
-            SwashContent::Color => self
+        match raster.format {
+            RasterGlyphFormat::Rgba => self
                 .color_atlas
-                .upload_color(&self.context.device, &self.context.queue, cache_key, &image)
+                .upload_color_bytes(
+                    &self.context.device,
+                    &self.context.queue,
+                    cache_key,
+                    GlyphBitmapUpload {
+                        placement_left: raster.placement_left,
+                        placement_top: raster.placement_top,
+                        width: raster.width,
+                        height: raster.height,
+                        bytes: &raster.bytes,
+                    },
+                )
                 .map(|entry| (GlyphAtlasKind::Color, entry)),
-            SwashContent::Mask | SwashContent::SubpixelMask => self
+            RasterGlyphFormat::Mask => self
                 .mono_atlas
-                .upload_mask(&self.context.device, &self.context.queue, cache_key, &image)
+                .upload_mask_bytes(
+                    &self.context.device,
+                    &self.context.queue,
+                    cache_key,
+                    GlyphBitmapUpload {
+                        placement_left: raster.placement_left,
+                        placement_top: raster.placement_top,
+                        width: raster.width,
+                        height: raster.height,
+                        bytes: &raster.bytes,
+                    },
+                )
                 .map(|entry| (GlyphAtlasKind::Mono, entry)),
         }
     }
@@ -331,21 +348,9 @@ impl RenderSystem {
                         });
                     }
                     GlyphAtlasKind::Color => {
-                        let cache_key = color_glyph_cache_key(glyph, prepare_context.scale_factor);
-                        let Some((_, entry)) =
-                            self.ensure_glyph_entry(prepare_context.text_system, cache_key)
-                        else {
-                            continue;
-                        };
-                        let color_origin = color_glyph_origin(
-                            glyph,
-                            text_bounds,
-                            run.baseline,
-                            prepare_context.scale_factor,
-                        );
                         let rect = crate::scene::LayoutBox {
-                            x: color_origin[0] + entry.placement_left as f32,
-                            y: color_origin[1] - entry.placement_top as f32,
+                            x: (physical.x + entry.placement_left) as f32,
+                            y: (physical.y - entry.placement_top) as f32,
                             width: entry.width as f32,
                             height: entry.height as f32,
                         };
@@ -359,8 +364,8 @@ impl RenderSystem {
                             height: entry.uv_rect[3],
                         };
                         let rect = [
-                            color_origin[0] + entry.placement_left as f32,
-                            color_origin[1] - entry.placement_top as f32,
+                            (physical.x + entry.placement_left) as f32,
+                            (physical.y - entry.placement_top) as f32,
                             entry.width as f32,
                             entry.height as f32,
                         ];
@@ -482,31 +487,6 @@ impl RenderSystem {
         clip_cache.insert(key, reference);
         reference
     }
-}
-
-fn color_glyph_cache_key(glyph: &cosmic_text::LayoutGlyph, scale_factor: f32) -> CacheKey {
-    let (cache_key, _, _) = CacheKey::new(
-        glyph.font_id,
-        glyph.glyph_id,
-        glyph.font_size * scale_factor,
-        (0.0, 0.0),
-        glyph.font_weight,
-        glyph.cache_key_flags,
-    );
-    cache_key
-}
-
-fn color_glyph_origin(
-    glyph: &cosmic_text::LayoutGlyph,
-    text_bounds: crate::scene::LayoutBox,
-    baseline: f32,
-    scale_factor: f32,
-) -> [f32; 2] {
-    let x_offset = glyph.font_size * glyph.x_offset;
-    let y_offset = glyph.font_size * glyph.y_offset;
-    let x = ((text_bounds.x + glyph.x + x_offset) * scale_factor).floor();
-    let y = ((text_bounds.y + baseline + glyph.y - y_offset) * scale_factor).floor();
-    [x, y]
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

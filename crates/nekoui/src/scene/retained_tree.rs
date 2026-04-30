@@ -94,6 +94,7 @@ fn build_text(
         children: SmallVec::new(),
         kind: NodeKind::Text {
             content: text_content.clone(),
+            block: Box::new(None),
             layout: None,
         },
         key: spec.key,

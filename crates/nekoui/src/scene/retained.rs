@@ -7,7 +7,7 @@ use taffy::prelude::{AvailableSpace, NodeId as TaffyNodeId, Size as TaffySize, T
 use crate::SharedString;
 use crate::element::{SpecArena, SpecNode, SpecNodeId, SpecPayload, WindowFrameArea};
 use crate::style::{Background, ResolvedStyle, ResolvedTextStyle};
-use crate::text_system::{SharedTextLayout, TextMeasureKey, TextSystem, measure_key};
+use crate::text_system::{SharedTextLayout, TextBlock, TextMeasureKey, TextSystem, measure_key};
 use crate::window::WindowSize;
 
 use super::retained_compile::get_or_build_subtree_fragment;
@@ -46,6 +46,7 @@ pub(crate) enum NodeKind {
     Div,
     Text {
         content: SharedString,
+        block: Box<Option<TextBlock>>,
         layout: Option<SharedTextLayout>,
     },
 }
@@ -170,16 +171,68 @@ impl RetainedTree {
             node.layout = next_layout;
 
             if let NodeKind::Text {
+                content,
+                block,
                 layout: text_layout,
-                ..
             } = &mut node.kind
             {
-                *text_layout =
+                let measured =
                     taffy
                         .get_node_context(node.taffy_node)
                         .and_then(|context| match context {
-                            MeasureContext::Text(text_context) => text_context.last_layout.clone(),
+                            MeasureContext::Text(text_context) => text_context
+                                .last_key
+                                .as_ref()
+                                .zip(text_context.last_layout.as_ref())
+                                .map(|(key, layout)| {
+                                    (key.width_bits.map(f32::from_bits), layout.clone())
+                                }),
                         });
+
+                match block.as_mut() {
+                    Some(block) => {
+                        if let Some((measured_width, measured_layout)) = measured.clone() {
+                            text_system.sync_text_block(
+                                block,
+                                content.clone(),
+                                node.style.text.clone(),
+                                measured_width,
+                            );
+                            block.layout = measured_layout.clone();
+                            *text_layout = Some(measured_layout);
+                        } else {
+                            let width = node.layout.width.is_finite().then_some(node.layout.width);
+                            text_system.sync_text_block(
+                                block,
+                                content.clone(),
+                                node.style.text.clone(),
+                                width,
+                            );
+                            *text_layout = Some(block.layout.clone());
+                        }
+                    }
+                    None => {
+                        if let Some((measured_width, measured_layout)) = measured {
+                            let mut new_block = text_system.new_text_block(
+                                content.clone(),
+                                node.style.text.clone(),
+                                measured_width,
+                            );
+                            new_block.layout = measured_layout.clone();
+                            *text_layout = Some(measured_layout);
+                            **block = Some(new_block);
+                        } else {
+                            let width = node.layout.width.is_finite().then_some(node.layout.width);
+                            let new_block = text_system.new_text_block(
+                                content.clone(),
+                                node.style.text.clone(),
+                                width,
+                            );
+                            *text_layout = Some(new_block.layout.clone());
+                            **block = Some(new_block);
+                        }
+                    }
+                };
             }
         }
     }
@@ -312,6 +365,35 @@ mod tests {
     }
 
     #[test]
+    fn text_block_reuses_taffy_measured_wrap_layout() {
+        let root = crate::div()
+            .width(px(200.0))
+            .padding(EdgeInsets::all(10.0))
+            .child(crate::text("hello neko ui hello neko ui hello neko ui").font_size(px(16.0)))
+            .into_any_element();
+
+        let mut tree = build_static_tree(root);
+        let mut text_system = TextSystem::new();
+        tree.compute_layout(WindowSize::new(200, 120), &mut text_system);
+
+        let text_id = tree.children(tree.root_id())[0];
+        let text_node = tree.node(text_id);
+        match &text_node.kind {
+            NodeKind::Text {
+                block,
+                layout: Some(layout),
+                ..
+            } => {
+                let block = block.as_ref().as_ref().expect("text block should exist");
+                assert!(Arc::ptr_eq(&block.layout, layout));
+                assert!(layout.width <= 180.0 + 0.5);
+                assert!(layout.runs.len() >= 2);
+            }
+            _ => panic!("expected text node"),
+        }
+    }
+
+    #[test]
     fn text_style_inherits_from_parent_div_and_child_can_override() {
         let inherited_color = Color::rgb(0x112233);
         let override_color = Color::rgb(0x445566);
@@ -417,6 +499,61 @@ mod tests {
             .unwrap();
         let dirty = tree.update_from_spec(&arena, built.root);
         assert_eq!(dirty, DirtyLaneMask::PAINT);
+    }
+
+    #[test]
+    fn text_block_owner_survives_paint_only_text_color_updates() {
+        let root = crate::div().child(crate::text("hello").color(Color::rgb(0x111111)));
+        let updated = crate::div().child(crate::text("hello").color(Color::rgb(0x222222)));
+
+        let mut tree = build_static_tree(root.into_any_element());
+        let mut text_system = TextSystem::new();
+        tree.compute_layout(WindowSize::new(320, 200), &mut text_system);
+
+        let text_id = tree.children(tree.root_id())[0];
+        let (original_layout, original_revision) = match &tree.node(text_id).kind {
+            NodeKind::Text {
+                block,
+                layout: Some(layout),
+                ..
+            } => {
+                let block = block.as_ref().as_ref().expect("text block should exist");
+                (layout.clone(), block.revision)
+            }
+            _ => panic!("expected text node"),
+        };
+
+        let window = test_window(WindowSize::new(320, 200), WindowSize::new(320, 200), 1.0);
+        let mut resolver = |_view_id: u64,
+                            _window: &WindowInfo|
+         -> Result<crate::AnyElement, crate::RuntimeError> {
+            unreachable!("static test tree should not resolve nested views")
+        };
+        let mut arena = SpecArena::new();
+        let built = BuildCx::new(&window, &mut resolver, &mut arena)
+            .build_root(updated.into_any_element())
+            .unwrap();
+        let dirty = tree.update_from_spec(&arena, built.root);
+        assert_eq!(dirty, DirtyLaneMask::PAINT);
+
+        tree.compute_layout(WindowSize::new(320, 200), &mut text_system);
+
+        match &tree.node(text_id).kind {
+            NodeKind::Text {
+                block,
+                layout: Some(layout),
+                ..
+            } => {
+                let block = block
+                    .as_ref()
+                    .as_ref()
+                    .expect("text block should still exist");
+                assert!(Arc::ptr_eq(&original_layout, layout));
+                assert_eq!(block.revision.layout, original_revision.layout);
+                assert_eq!(block.revision.style, original_revision.style + 1);
+            }
+            _ => panic!("expected text node"),
+        }
     }
 
     #[test]

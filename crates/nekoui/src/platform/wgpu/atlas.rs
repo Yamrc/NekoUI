@@ -54,6 +54,24 @@ struct AtlasPage {
     last_used_frame: u64,
 }
 
+struct UploadPayload {
+    placement_left: i32,
+    placement_top: i32,
+    width: u32,
+    height: u32,
+    bytes: Vec<u8>,
+    bytes_per_row: u32,
+    padding: u32,
+}
+
+pub(crate) struct GlyphBitmapUpload<'a> {
+    pub(crate) placement_left: i32,
+    pub(crate) placement_top: i32,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) bytes: &'a [u8],
+}
+
 impl GlyphAtlas {
     pub(crate) fn new(
         _device: &Device,
@@ -101,35 +119,54 @@ impl GlyphAtlas {
         self.generation
     }
 
-    pub(crate) fn upload_mask(
+    pub(crate) fn upload_mask_bytes(
         &mut self,
         device: &Device,
         queue: &Queue,
         key: CacheKey,
-        image: &cosmic_text::SwashImage,
+        upload: GlyphBitmapUpload<'_>,
     ) -> Option<AtlasEntry> {
         debug_assert_eq!(self.kind, GlyphAtlasKind::Mono);
         self.upload_impl(
             device,
             queue,
             key,
-            image,
-            image.data.clone(),
-            image.placement.width,
+            UploadPayload {
+                placement_left: upload.placement_left,
+                placement_top: upload.placement_top,
+                width: upload.width,
+                height: upload.height,
+                bytes: upload.bytes.to_vec(),
+                bytes_per_row: upload.width,
+                padding: 0,
+            },
         )
     }
 
-    pub(crate) fn upload_color(
+    pub(crate) fn upload_color_bytes(
         &mut self,
         device: &Device,
         queue: &Queue,
         key: CacheKey,
-        image: &cosmic_text::SwashImage,
+        upload: GlyphBitmapUpload<'_>,
     ) -> Option<AtlasEntry> {
         debug_assert_eq!(self.kind, GlyphAtlasKind::Color);
-        let mut bytes = image.data.clone();
-        premultiplied_rgba_to_straight_rgba(&mut bytes);
-        self.upload_impl(device, queue, key, image, bytes, image.placement.width * 4)
+        let padding = 1;
+        let padded_width = upload.width + padding * 2;
+        self.upload_impl(
+            device,
+            queue,
+            key,
+            UploadPayload {
+                placement_left: upload.placement_left,
+                placement_top: upload.placement_top,
+                width: upload.width,
+                height: upload.height,
+                bytes: pad_rgba_with_border(upload.bytes, upload.width, upload.height, padding),
+                bytes_per_row: padded_width * 4,
+                padding,
+            },
+        )
     }
 
     fn upload_impl(
@@ -137,20 +174,20 @@ impl GlyphAtlas {
         device: &Device,
         queue: &Queue,
         key: CacheKey,
-        image: &cosmic_text::SwashImage,
-        bytes: Vec<u8>,
-        bytes_per_row: u32,
+        payload: UploadPayload,
     ) -> Option<AtlasEntry> {
         if let Some(entry) = self.entries.get(&key).copied() {
             self.mark_page_used(entry.page_id);
             return Some(entry);
         }
 
-        if image.placement.width == 0 || image.placement.height == 0 {
+        if payload.width == 0 || payload.height == 0 {
             return None;
         }
 
-        let size = size2(image.placement.width as i32, image.placement.height as i32);
+        let padded_width = payload.width + payload.padding * 2;
+        let padded_height = payload.height + payload.padding * 2;
+        let size = size2(padded_width as i32, padded_height as i32);
         let (page_index, allocation) = self.allocate_page_region(device, size)?;
         let page_id = self.pages[page_index].id;
 
@@ -165,33 +202,35 @@ impl GlyphAtlas {
                 },
                 aspect: TextureAspect::All,
             },
-            &bytes,
+            &payload.bytes,
             TexelCopyBufferLayout {
                 offset: 0,
-                bytes_per_row: Some(bytes_per_row),
-                rows_per_image: Some(image.placement.height),
+                bytes_per_row: Some(payload.bytes_per_row),
+                rows_per_image: Some(padded_height),
             },
             wgpu::Extent3d {
-                width: image.placement.width,
-                height: image.placement.height,
+                width: padded_width,
+                height: padded_height,
                 depth_or_array_layers: 1,
             },
         );
 
         let atlas_width = self.width as f32;
         let atlas_height = self.height as f32;
+        let uv_origin_x = allocation.rectangle.min.x as f32 + payload.padding as f32;
+        let uv_origin_y = allocation.rectangle.min.y as f32 + payload.padding as f32;
         let entry = AtlasEntry {
             page_id,
             _allocation: allocation,
-            placement_left: image.placement.left,
-            placement_top: image.placement.top,
-            width: image.placement.width,
-            height: image.placement.height,
+            placement_left: payload.placement_left,
+            placement_top: payload.placement_top,
+            width: payload.width,
+            height: payload.height,
             uv_rect: [
-                allocation.rectangle.min.x as f32 / atlas_width,
-                allocation.rectangle.min.y as f32 / atlas_height,
-                image.placement.width as f32 / atlas_width,
-                image.placement.height as f32 / atlas_height,
+                uv_origin_x / atlas_width,
+                uv_origin_y / atlas_height,
+                payload.width as f32 / atlas_width,
+                payload.height as f32 / atlas_height,
             ],
         };
         self.pages[page_index].entries.insert(key, entry);
@@ -221,7 +260,7 @@ impl GlyphAtlas {
             dimension: TextureDimension::D2,
             format: match self.kind {
                 GlyphAtlasKind::Mono => TextureFormat::R8Unorm,
-                GlyphAtlasKind::Color => TextureFormat::Rgba8Unorm,
+                GlyphAtlasKind::Color => TextureFormat::Rgba8UnormSrgb,
             },
             usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
             view_formats: &[],
@@ -400,29 +439,58 @@ fn eviction_page_ids(pages: &[AtlasPageState], max_pages: usize) -> Vec<u32> {
         .collect()
 }
 
-fn premultiplied_rgba_to_straight_rgba(bytes: &mut [u8]) {
-    for pixel in bytes.chunks_exact_mut(4) {
-        let alpha = u16::from(pixel[3]);
-        if alpha == 0 {
-            pixel[0] = 0;
-            pixel[1] = 0;
-            pixel[2] = 0;
-            continue;
-        }
+fn pad_rgba_with_border(bytes: &[u8], width: u32, height: u32, padding: u32) -> Vec<u8> {
+    let padded_width = width + padding * 2;
+    let padded_height = height + padding * 2;
+    let mut out = vec![0_u8; (padded_width * padded_height * 4) as usize];
 
-        let inv_alpha = 255.0 / alpha as f32;
-        pixel[0] = (pixel[0] as f32 * inv_alpha).clamp(0.0, 255.0) as u8;
-        pixel[1] = (pixel[1] as f32 * inv_alpha).clamp(0.0, 255.0) as u8;
-        pixel[2] = (pixel[2] as f32 * inv_alpha).clamp(0.0, 255.0) as u8;
+    for y in 0..height {
+        for x in 0..width {
+            let src_index = ((y * width + x) * 4) as usize;
+            let dst_x = x + padding;
+            let dst_y = y + padding;
+            let dst_index = ((dst_y * padded_width + dst_x) * 4) as usize;
+            out[dst_index..dst_index + 4].copy_from_slice(&bytes[src_index..src_index + 4]);
+        }
     }
+
+    if padding == 0 || width == 0 || height == 0 {
+        return out;
+    }
+
+    for y in padding..(padding + height) {
+        let row_start = (y * padded_width * 4) as usize;
+        let first = row_start + (padding * 4) as usize;
+        let last = row_start + ((padding + width - 1) * 4) as usize;
+        let first_pixel = [out[first], out[first + 1], out[first + 2], out[first + 3]];
+        let last_pixel = [out[last], out[last + 1], out[last + 2], out[last + 3]];
+        for px in 0..padding {
+            let left = row_start + (px * 4) as usize;
+            out[left..left + 4].copy_from_slice(&first_pixel);
+            let right = row_start + ((padding + width + px) * 4) as usize;
+            out[right..right + 4].copy_from_slice(&last_pixel);
+        }
+    }
+
+    for px_y in 0..padding {
+        let src_top = (padding * padded_width * 4) as usize;
+        let dst_top = (px_y * padded_width * 4) as usize;
+        out.copy_within(src_top..src_top + (padded_width * 4) as usize, dst_top);
+
+        let src_bottom = ((padding + height - 1) * padded_width * 4) as usize;
+        let dst_bottom = ((padding + height + px_y) * padded_width * 4) as usize;
+        out.copy_within(
+            src_bottom..src_bottom + (padded_width * 4) as usize,
+            dst_bottom,
+        );
+    }
+
+    out
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        AtlasPageState, GLYPH_ATLAS_BYTE_BUDGET, eviction_page_ids,
-        premultiplied_rgba_to_straight_rgba,
-    };
+    use super::{AtlasPageState, GLYPH_ATLAS_BYTE_BUDGET, eviction_page_ids, pad_rgba_with_border};
 
     #[test]
     fn eviction_prefers_oldest_unused_pages() {
@@ -495,9 +563,12 @@ mod tests {
     }
 
     #[test]
-    fn premultiplied_rgba_normalization_restores_straight_alpha() {
-        let mut bytes = vec![128, 64, 32, 128, 0, 0, 0, 0];
-        premultiplied_rgba_to_straight_rgba(&mut bytes);
-        assert_eq!(bytes, vec![255, 127, 63, 128, 0, 0, 0, 0]);
+    fn color_upload_copies_edge_padding() {
+        let bytes = vec![0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80];
+        let out = pad_rgba_with_border(&bytes, 2, 1, 1);
+        assert_eq!(out.len(), 4 * 4 * 3);
+        assert_eq!(&out[0..4], &[0x10, 0x20, 0x30, 0x40]);
+        assert_eq!(&out[4..8], &[0x10, 0x20, 0x30, 0x40]);
+        assert_eq!(&out[8..12], &[0x50, 0x60, 0x70, 0x80]);
     }
 }

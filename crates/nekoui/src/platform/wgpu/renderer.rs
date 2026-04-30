@@ -9,7 +9,7 @@ mod upload;
 use std::sync::Arc;
 
 use bytemuck::bytes_of;
-use cosmic_text::{Color as CosmicColor, SwashCache};
+use cosmic_text::Color as CosmicColor;
 use wgpu::util::{DeviceExt, StagingBelt};
 use wgpu::{
     BindGroup, BindGroupDescriptor, BindGroupEntry, BindGroupLayout, BindGroupLayoutDescriptor,
@@ -61,7 +61,6 @@ pub struct RenderSystem {
     color_text_bind_group: BindGroup,
     mono_atlas: GlyphAtlas,
     color_atlas: GlyphAtlas,
-    swash_cache: SwashCache,
     rect_instances: Vec<RectInstance>,
     mono_text_instances: Vec<TextInstance>,
     color_text_instances: Vec<ColorTextInstance>,
@@ -260,7 +259,6 @@ impl RenderSystem {
             color_text_bind_group,
             mono_atlas,
             color_atlas,
-            swash_cache: SwashCache::new(),
             rect_instances: Vec::new(),
             mono_text_instances: Vec::new(),
             color_text_instances: Vec::new(),

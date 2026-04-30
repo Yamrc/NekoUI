@@ -103,16 +103,22 @@ fn diff_text(
             .expect("text style patch must succeed");
     }
 
-    if let NodeKind::Text { content, layout } = &mut tree.nodes[node_id].kind {
+    if let NodeKind::Text {
+        content,
+        block,
+        layout,
+    } = &mut tree.nodes[node_id].kind
+    {
         *content = text_content.clone();
-        if style_change.layout || style_change.paint || style_change.text_shape || content_changed {
+        if style_change.layout || style_change.text_shape || content_changed {
+            **block = None;
             *layout = None;
         }
     }
     tree.nodes[node_id].key = spec.key;
     tree.nodes[node_id].window_frame_area = spec.window_frame_area;
 
-    if !dirty.is_empty() {
+    if style_change.layout || style_change.text_shape || content_changed {
         tree.taffy
             .set_node_context(
                 tree.nodes[node_id].taffy_node,

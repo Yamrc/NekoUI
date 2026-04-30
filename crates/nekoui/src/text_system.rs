@@ -6,7 +6,8 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
-use cosmic_text::{Align, Attrs, Buffer, FontSystem, Metrics, Shaping, Wrap};
+use cosmic_text::{Align, Attrs, Buffer, FontSystem, Metrics, Shaping, SwashCache, Wrap};
+use swash::scale::image::Content as SwashContent;
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::SharedString;
@@ -16,7 +17,11 @@ use self::cache::AdaptiveLruCache;
 use self::selector::{
     ClusterFamilyIndexCacheKey, FamilyCandidateCacheKey, default_text_attrs, text_align, text_attrs,
 };
-pub use self::types::{SharedTextLayout, TextCacheStats, TextLayout, TextMeasureKey, TextRun};
+pub(crate) use self::types::{
+    RasterGlyph, RasterGlyphFormat, SharedTextLayout, TextBlock, TextBlockBufferConfig,
+    TextBlockRevision, TextBlockShapeKey,
+};
+pub use self::types::{TextCacheStats, TextLayout, TextMeasureKey, TextRun};
 
 const DEFAULT_REM_SIZE_PX: f32 = 16.0;
 const MEASURE_CACHE_BASE_LIMIT: usize = 2_048;
@@ -33,6 +38,7 @@ pub struct TextSystem {
     family_candidate_cache:
         AdaptiveLruCache<FamilyCandidateCacheKey, Arc<[cosmic_text::fontdb::ID]>>,
     cluster_family_index_cache: AdaptiveLruCache<ClusterFamilyIndexCacheKey, Option<usize>>,
+    swash_cache: SwashCache,
     cache_stats: TextCacheStats,
 }
 
@@ -49,6 +55,7 @@ impl TextSystem {
                 CLUSTER_FAMILY_INDEX_CACHE_BASE_LIMIT,
                 CLUSTER_FAMILY_INDEX_CACHE_MAX_LIMIT,
             ),
+            swash_cache: SwashCache::new(),
             cache_stats: TextCacheStats::default(),
         }
     }
@@ -67,62 +74,174 @@ impl TextSystem {
         }
 
         self.cache_stats.misses += 1;
-        let layout = self.shape_and_layout(text, style, width);
-        let shared = Arc::new(layout);
+        let block = self.new_text_block(text.clone(), style.clone(), width);
+        let shared = block.layout.clone();
         self.measure_cache.insert(key, shared.clone());
         shared
     }
 
-    fn shape_and_layout(
+    pub(crate) fn new_text_block(
         &mut self,
-        text: &SharedString,
+        text: SharedString,
+        style: ResolvedTextStyle,
+        width: Option<f32>,
+    ) -> TextBlock {
+        let revision = TextBlockRevision::new();
+        let shape_key = TextBlockShapeKey {
+            text_hash: hash_value(text.as_ref()),
+            style_hash: hash_text_shape_style(&style),
+            width_bits: width.map(f32::to_bits),
+        };
+        let config = self.buffer_config(&style, width);
+        let mut buffer = Buffer::new(&mut self.font_system, config.metrics);
+        self.configure_buffer(&mut buffer, config);
+        self.set_buffer_text(&mut buffer, text.as_ref(), &style, config.requested_width);
+        let layout = Arc::new(self.collect_layout(&buffer));
+
+        TextBlock {
+            text,
+            style,
+            width,
+            revision: TextBlockRevision {
+                layout: 1,
+                ..revision
+            },
+            shape_key,
+            buffer,
+            layout,
+        }
+    }
+
+    pub(crate) fn sync_text_block(
+        &mut self,
+        block: &mut TextBlock,
+        text: SharedString,
+        style: ResolvedTextStyle,
+        width: Option<f32>,
+    ) {
+        let next_shape_key = TextBlockShapeKey {
+            text_hash: hash_value(text.as_ref()),
+            style_hash: hash_text_shape_style(&style),
+            width_bits: width.map(f32::to_bits),
+        };
+        let shape_changed = block.shape_key != next_shape_key;
+
+        if block.text.as_ref() != text.as_ref() {
+            block.text = text;
+            block.revision.text = block.revision.text.saturating_add(1);
+        }
+        if block.style != style {
+            block.style = style;
+            block.revision.style = block.revision.style.saturating_add(1);
+        }
+        if block.width != width {
+            block.width = width;
+            block.revision.width = block.revision.width.saturating_add(1);
+        }
+
+        if !shape_changed {
+            return;
+        }
+
+        let config = self.buffer_config(&block.style, block.width);
+        self.configure_buffer(&mut block.buffer, config);
+        self.set_buffer_text(
+            &mut block.buffer,
+            block.text.as_ref(),
+            &block.style,
+            config.requested_width,
+        );
+        block.layout = Arc::new(self.collect_layout(&block.buffer));
+        block.shape_key = next_shape_key;
+        block.revision.layout = block.revision.layout.saturating_add(1);
+    }
+
+    fn buffer_config(
+        &self,
         style: &ResolvedTextStyle,
         width: Option<f32>,
-    ) -> TextLayout {
+    ) -> TextBlockBufferConfig {
         let font_size = resolve_absolute(style.font_size);
         let line_height = style
             .line_height
             .map(|line_height| resolve_definite(line_height, font_size))
             .unwrap_or(font_size * 1.2);
-        let metrics = Metrics::new(font_size, line_height);
-        let attrs = default_text_attrs(style);
-        let alignment = Some(text_align(style.text_align));
         let wrap = match style.white_space {
             WhiteSpace::Normal => Wrap::WordOrGlyph,
             WhiteSpace::Nowrap => Wrap::None,
         };
-        let effective_width = match style.white_space {
-            WhiteSpace::Normal => width,
+        let requested_width = width;
+        let width = match style.white_space {
+            WhiteSpace::Normal => requested_width,
             WhiteSpace::Nowrap => None,
         };
 
-        let mut buffer = self.build_buffer(BuildBufferRequest {
-            text,
-            metrics,
-            style,
-            attrs: &attrs,
-            width: effective_width,
-            alignment,
+        TextBlockBufferConfig {
+            metrics: Metrics::new(font_size, line_height),
             wrap,
-        });
+            width,
+            requested_width,
+        }
+    }
+
+    fn configure_buffer(&mut self, buffer: &mut Buffer, config: TextBlockBufferConfig) {
+        buffer.set_metrics(&mut self.font_system, config.metrics);
+        buffer.set_wrap(&mut self.font_system, config.wrap);
+        buffer.set_size(&mut self.font_system, config.width, None);
+    }
+
+    fn set_buffer_text(
+        &mut self,
+        buffer: &mut Buffer,
+        text: &str,
+        style: &ResolvedTextStyle,
+        requested_width: Option<f32>,
+    ) {
+        let attrs = default_text_attrs(style);
+        let spans = self.rich_text_spans(text, style);
+        buffer.set_rich_text(
+            &mut self.font_system,
+            spans.iter().map(|(range, family_index)| {
+                (
+                    &text[range.clone()],
+                    family_index
+                        .and_then(|index| style.font_families.get(index))
+                        .map_or_else(|| attrs.clone(), |family| text_attrs(style, family)),
+                )
+            }),
+            &attrs,
+            Shaping::Advanced,
+            Some(text_align(style.text_align)),
+        );
+        buffer.shape_until_scroll(&mut self.font_system, false);
 
         if matches!(style.white_space, WhiteSpace::Nowrap)
             && matches!(style.text_overflow, Some(TextOverflow::Ellipsis))
-            && let Some(max_width) = width
-            && current_layout_width(&buffer) > max_width
+            && let Some(max_width) = requested_width
+            && current_layout_width(buffer) > max_width
         {
-            let truncated = self.truncate_text_to_width(text, metrics, &attrs, style, max_width);
-            buffer = self.build_buffer(BuildBufferRequest {
-                text: &truncated,
-                metrics,
-                style,
-                attrs: &attrs,
-                width: Some(max_width),
-                alignment,
-                wrap: Wrap::None,
-            });
+            let truncated =
+                self.truncate_text_to_width(text, buffer.metrics(), &attrs, style, max_width);
+            let spans = self.rich_text_spans(&truncated, style);
+            buffer.set_rich_text(
+                &mut self.font_system,
+                spans.iter().map(|(range, family_index)| {
+                    (
+                        &truncated[range.clone()],
+                        family_index
+                            .and_then(|index| style.font_families.get(index))
+                            .map_or_else(|| attrs.clone(), |family| text_attrs(style, family)),
+                    )
+                }),
+                &attrs,
+                Shaping::Advanced,
+                Some(text_align(style.text_align)),
+            );
+            buffer.shape_until_scroll(&mut self.font_system, false);
         }
+    }
 
+    fn collect_layout(&self, buffer: &Buffer) -> TextLayout {
         let mut runs = Vec::new();
         let mut width_px = 0.0_f32;
         let mut height_px = 0.0_f32;
@@ -141,32 +260,6 @@ impl TextSystem {
             height: height_px,
             runs,
         }
-    }
-
-    fn build_buffer(&mut self, request: BuildBufferRequest<'_>) -> Buffer {
-        let mut buffer = Buffer::new(&mut self.font_system, request.metrics);
-        buffer.set_size(&mut self.font_system, request.width, None);
-        buffer.set_wrap(&mut self.font_system, request.wrap);
-        let spans = self.rich_text_spans(request.text, request.style);
-        buffer.set_rich_text(
-            &mut self.font_system,
-            spans.iter().map(|(range, family_index)| {
-                (
-                    &request.text[range.clone()],
-                    family_index
-                        .and_then(|index| request.style.font_families.get(index))
-                        .map_or_else(
-                            || request.attrs.clone(),
-                            |family| text_attrs(request.style, family),
-                        ),
-                )
-            }),
-            request.attrs,
-            Shaping::Advanced,
-            request.alignment,
-        );
-        buffer.shape_until_scroll(&mut self.font_system, false);
-        buffer
     }
 
     fn truncate_text_to_width(
@@ -221,15 +314,32 @@ impl TextSystem {
         style: &ResolvedTextStyle,
         attrs: &Attrs<'_>,
     ) -> f32 {
-        let buffer = self.build_buffer(BuildBufferRequest {
-            text,
-            metrics,
-            style,
+        let mut buffer = Buffer::new(&mut self.font_system, metrics);
+        self.configure_buffer(
+            &mut buffer,
+            TextBlockBufferConfig {
+                metrics,
+                wrap: Wrap::None,
+                width: None,
+                requested_width: None,
+            },
+        );
+        let spans = self.rich_text_spans(text, style);
+        buffer.set_rich_text(
+            &mut self.font_system,
+            spans.iter().map(|(range, family_index)| {
+                (
+                    &text[range.clone()],
+                    family_index
+                        .and_then(|index| style.font_families.get(index))
+                        .map_or_else(|| attrs.clone(), |family| text_attrs(style, family)),
+                )
+            }),
             attrs,
-            width: None,
-            alignment: Some(Align::Left),
-            wrap: Wrap::None,
-        });
+            Shaping::Advanced,
+            Some(Align::Left),
+        );
+        buffer.shape_until_scroll(&mut self.font_system, false);
         current_layout_width(&buffer)
     }
 
@@ -246,8 +356,47 @@ impl TextSystem {
         self.cache_stats = TextCacheStats::default();
     }
 
-    pub(crate) fn font_system_mut(&mut self) -> &mut FontSystem {
-        &mut self.font_system
+    pub(crate) fn raster_glyph(&mut self, cache_key: cosmic_text::CacheKey) -> Option<RasterGlyph> {
+        self.raster_glyph_via_swash(cache_key)
+    }
+
+    fn raster_glyph_via_swash(&mut self, cache_key: cosmic_text::CacheKey) -> Option<RasterGlyph> {
+        let font_system = &mut self.font_system;
+        let swash_cache = &mut self.swash_cache;
+        let image = swash_cache
+            .get_image(font_system, cache_key)
+            .as_ref()?
+            .clone();
+
+        match image.content {
+            SwashContent::Mask => Some(RasterGlyph {
+                placement_left: image.placement.left,
+                placement_top: image.placement.top,
+                width: image.placement.width,
+                height: image.placement.height,
+                format: RasterGlyphFormat::Mask,
+                bytes: image.data,
+            }),
+            // We do not have a dedicated LCD text pipeline yet, but we must keep
+            // subpixel glyphs renderable instead of dropping them entirely.
+            // Collapse the per-subpixel coverages to a grayscale mask for now.
+            SwashContent::SubpixelMask => Some(RasterGlyph {
+                placement_left: image.placement.left,
+                placement_top: image.placement.top,
+                width: image.placement.width,
+                height: image.placement.height,
+                format: RasterGlyphFormat::Mask,
+                bytes: subpixel_mask_to_alpha(&image.data),
+            }),
+            SwashContent::Color => Some(RasterGlyph {
+                placement_left: image.placement.left,
+                placement_top: image.placement.top,
+                width: image.placement.width,
+                height: image.placement.height,
+                format: RasterGlyphFormat::Rgba,
+                bytes: image.data,
+            }),
+        }
     }
 }
 
@@ -264,12 +413,12 @@ pub(crate) fn measure_key(
 ) -> TextMeasureKey {
     TextMeasureKey {
         text_hash: hash_value(text.as_ref()),
-        style_hash: hash_text_style(style),
+        style_hash: hash_text_shape_style(style),
         width_bits: width.map(f32::to_bits),
     }
 }
 
-fn hash_text_style(style: &ResolvedTextStyle) -> u64 {
+fn hash_text_shape_style(style: &ResolvedTextStyle) -> u64 {
     let mut hasher = DefaultHasher::new();
     style.font_families.hash(&mut hasher);
     hash_absolute(style.font_size, &mut hasher);
@@ -279,10 +428,6 @@ fn hash_text_style(style: &ResolvedTextStyle) -> u64 {
     style.text_align.hash(&mut hasher);
     style.white_space.hash(&mut hasher);
     style.text_overflow.hash(&mut hasher);
-    style.color.r.to_bits().hash(&mut hasher);
-    style.color.g.to_bits().hash(&mut hasher);
-    style.color.b.to_bits().hash(&mut hasher);
-    style.color.a.to_bits().hash(&mut hasher);
     hasher.finish()
 }
 
@@ -345,18 +490,79 @@ fn hash_definite(value: Definite, hasher: &mut DefaultHasher) {
     }
 }
 
-struct BuildBufferRequest<'a> {
-    text: &'a str,
-    metrics: Metrics,
-    style: &'a ResolvedTextStyle,
-    attrs: &'a Attrs<'a>,
-    width: Option<f32>,
-    alignment: Option<Align>,
-    wrap: Wrap,
-}
-
 fn hash_value(value: &str) -> u64 {
     let mut hasher = DefaultHasher::new();
     value.hash(&mut hasher);
     hasher.finish()
+}
+
+fn subpixel_mask_to_alpha(bytes: &[u8]) -> Vec<u8> {
+    bytes
+        .chunks_exact(4)
+        .map(|pixel| ((u16::from(pixel[0]) + u16::from(pixel[1]) + u16::from(pixel[2])) / 3) as u8)
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use crate::style::{Color, ResolvedTextStyle, TextOverflow, WhiteSpace};
+
+    use super::{TextSystem, measure_key, subpixel_mask_to_alpha};
+
+    #[test]
+    fn measure_key_ignores_paint_only_text_color_changes() {
+        let text = Arc::<str>::from("hello color");
+        let old = ResolvedTextStyle::default();
+        let mut new = old.clone();
+        new.color = Color::rgb(0x336699);
+
+        assert_eq!(
+            measure_key(&text, &old, Some(240.0)),
+            measure_key(&text, &new, Some(240.0))
+        );
+    }
+
+    #[test]
+    fn sync_text_block_preserves_layout_for_paint_only_style_changes() {
+        let mut text_system = TextSystem::new();
+        let text = Arc::<str>::from("hello color");
+        let old = ResolvedTextStyle::default();
+        let mut new = old.clone();
+        new.color = Color::rgb(0x336699);
+
+        let mut block = text_system.new_text_block(text.clone(), old, Some(240.0));
+        let original_layout = block.layout.clone();
+        let original_revision = block.revision;
+
+        text_system.sync_text_block(&mut block, text, new.clone(), Some(240.0));
+
+        assert!(Arc::ptr_eq(&original_layout, &block.layout));
+        assert_eq!(block.revision.layout, original_revision.layout);
+        assert_eq!(block.revision.style, original_revision.style + 1);
+        assert_eq!(block.style, new);
+    }
+
+    #[test]
+    fn subpixel_mask_falls_back_to_grayscale_alpha() {
+        let bytes = [0_u8, 120, 240, 255, 30, 60, 90, 255];
+        let alpha = subpixel_mask_to_alpha(&bytes);
+        assert_eq!(alpha, vec![120, 60]);
+    }
+
+    #[test]
+    fn nowrap_ellipsis_uses_requested_width_constraint() {
+        let mut text_system = TextSystem::new();
+        let text =
+            Arc::<str>::from("This is a deliberately long single-line text run for ellipsis.");
+        let style = ResolvedTextStyle {
+            white_space: WhiteSpace::Nowrap,
+            text_overflow: Some(TextOverflow::Ellipsis),
+            ..ResolvedTextStyle::default()
+        };
+
+        let layout = text_system.measure(&text, &style, Some(140.0));
+        assert!(layout.width <= 140.0);
+    }
 }
